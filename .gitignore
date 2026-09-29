@@ -1,0 +1,6 @@
+bin/
+obj/
+dist/
+*.log
+selftest-report.txt
+selftest-shots/

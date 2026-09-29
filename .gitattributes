@@ -1,0 +1,17 @@
+# 一律以 LF 存进仓库，检出时按各人自己的 core.autocrlf 决定，避免整文件 diff 抖动
+* text=auto
+
+*.cs     text diff=csharp
+*.csproj text
+*.md     text
+*.gitignore text
+LICENSE  text
+
+# 二进制，别做任何换行转换
+*.png binary
+*.jpg binary
+*.ico binary
+*.cur binary
+*.ani binary
+*.exe binary
+*.zip binary
