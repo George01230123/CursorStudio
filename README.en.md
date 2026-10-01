@@ -4,10 +4,13 @@
 
 Turn your own images into Windows mouse cursors and apply them system-wide in one click.
 
-The repository ships source only (binaries stay out of version control). Build it yourself:
+**[Download the latest release](https://github.com/George01230123/CursorStudio/releases/latest)** — a single-file
+exe, ~47 MB, no installer and no .NET runtime required; copy it anywhere and run it.
+
+Or build it yourself (binaries stay out of version control, as usual):
 
 ```bash
-dotnet publish -c Release -o dist      # single-file exe, ~49 MB, runs anywhere, no .NET install needed
+dotnet publish -c Release -o dist
 ```
 
 The output is `dist\CursorStudio.exe` — rename it to whatever you like.

@@ -4,10 +4,13 @@
 
 把你自己导入的图片做成 Windows 鼠标指针，一键套用到全系统。
 
-仓库里只有源码（二进制不进版本库）。自己编一个：
+**[下载最新版](https://github.com/George01230123/CursorStudio/releases/latest)** —— 单文件 exe，约 47 MB，
+免安装、不用装 .NET，拷到哪都能跑。
+
+也可以自己编（仓库里按惯例不放二进制）：
 
 ```bash
-dotnet publish -c Release -o dist      # 单文件 exe，约 49 MB，拷到哪都能跑，不用装 .NET
+dotnet publish -c Release -o dist
 ```
 
 出来的文件是 `dist\CursorStudio.exe`，改成什么名字都行（比如「鼠标指针美化.exe」）。
