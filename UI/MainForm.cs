@@ -36,6 +36,13 @@ public sealed class MainForm : Form
     private Button _bgColorBtn = null!, _btnMatchSystem = null!;
     private Label _scalePx = null!;
 
+    // 动画
+    private NumericUpDown _delayNum = null!;
+    private Label _frameInfo = null!;
+    private Button _btnStatic = null!;
+    private readonly System.Windows.Forms.Timer _animTimer = new();
+    private int _previewFrame;
+
     // 试一试 + 状态 + 方案
     private Panel _tryPanel = null!;
     private Label _tryLabel = null!;
@@ -57,13 +64,27 @@ public sealed class MainForm : Form
         BuildUi();
         LoadStateOrDefault();
 
+        _animTimer.Tick += (_, _) => AdvancePreviewFrame();
+
         Shown += (_, _) =>
         {
             TuneSplitter();
             RefreshSlotList();
             SelectSlot(_current);
         };
-        FormClosing += (_, _) => SaveState();
+        FormClosing += (_, _) =>
+        {
+            SaveState();
+            // 这几个都是进程级的资源，以前一直没显式放：
+            // 关窗口就退出，靠进程回收也不会出问题，但句柄和 GDI 对象该还的还是要还
+            _animTimer.Stop();
+            _cache.Dispose();
+            if (_previewHandle != IntPtr.Zero)
+            {
+                Win32.SafeDestroyCursor(_previewHandle);
+                _previewHandle = IntPtr.Zero;
+            }
+        };
     }
 
     // ================================================================ 界面搭建
@@ -212,7 +233,9 @@ public sealed class MainForm : Form
         detail.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         detail.RowStyles.Add(new RowStyle(SizeType.Percent, 100));   // 预览 + 热点
         detail.RowStyles.Add(new RowStyle(SizeType.AutoSize));       // 设置
-        detail.RowStyles.Add(new RowStyle(SizeType.Absolute, 96));   // 试一试
+        // 96 改成 80：设置区多了一行「动画帧」之后，最小窗口（940×640）下
+        // 右侧那条指针位说明就只剩 30px，文字会被截掉。这里让出 16px 给它
+        detail.RowStyles.Add(new RowStyle(SizeType.Absolute, 80));   // 试一试
 
         detail.Controls.Add(BuildPreviewRow(), 0, 0);
         detail.Controls.Add(BuildSettingsGrid(), 0, 1);
@@ -311,7 +334,7 @@ public sealed class MainForm : Form
             AutoSize = true,
             AutoSizeMode = AutoSizeMode.GrowAndShrink,
             ColumnCount = 4,
-            RowCount = 4,
+            RowCount = 5,
             GrowStyle = TableLayoutPanelGrowStyle.FixedSize,
             Margin = new Padding(0, 8, 0, 0),
             Padding = new Padding(10, 8, 10, 8),
@@ -321,7 +344,7 @@ public sealed class MainForm : Form
         g.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 202));
         g.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         g.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        for (int i = 0; i < 4; i++) g.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        for (int i = 0; i < 5; i++) g.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
         // 下拉项的文案要短。DropDownList 只显示选中项，太长会被右边的箭头盖住
         // （截成"32 × 32 （Window▾"这种），宽度按最长的一项留够
@@ -448,6 +471,48 @@ public sealed class MainForm : Form
         tol.Controls.Add(new Label { Text = "容差", AutoSize = true, Margin = new Padding(0, 6, 4, 0) });
         tol.Controls.Add(_tolerance);
         g.Controls.Add(tol, 3, 3);
+
+        // 第 5 行：动画。只有导入多帧（GIF 或一次选多张图）之后才用得上，
+        // 没有动画时整行禁用，免得让人以为静态指针坏了
+        _delayNum = new NumericUpDown
+        {
+            Width = 62,
+            Minimum = AniFile.MinDelayMs,
+            Maximum = AniFile.MaxDelayMs,
+            Increment = 10,
+            Value = AniFile.DefaultDelayMs,
+            Margin = new Padding(0, 2, 2, 2),
+        };
+        _delayNum.ValueChanged += (_, _) => OnAnimationChanged();
+
+        _frameInfo = new Label
+        {
+            AutoSize = true,
+            ForeColor = SystemColors.GrayText,
+            Margin = new Padding(6, 6, 0, 2),
+        };
+
+        _btnStatic = new Button
+        {
+            Text = "只用第一帧",
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            MinimumSize = new Size(0, 26),
+            Padding = new Padding(10, 0, 10, 0),
+            Margin = new Padding(10, 2, 12, 2),
+            FlatStyle = FlatStyle.System,
+        };
+        _btnStatic.Click += (_, _) => DropAnimation();
+
+        g.Controls.Add(MakeCaption("动画帧"), 0, 4);
+
+        var delayRow = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Margin = new Padding(0), WrapContents = false };
+        delayRow.Controls.Add(_delayNum);
+        delayRow.Controls.Add(new Label { Text = "毫秒 / 帧", AutoSize = true, Margin = new Padding(2, 6, 0, 0) });
+        g.Controls.Add(delayRow, 1, 4);
+
+        g.Controls.Add(_btnStatic, 2, 4);
+        g.Controls.Add(_frameInfo, 3, 4);
 
         return g;
     }
@@ -682,6 +747,7 @@ public sealed class MainForm : Form
             _bgColorBtn.Tag = SlotState.ParseColor(st.BackgroundKey, Color.White);
             UpdateBgButtonFace();
             UpdateBgEnabled();
+            UpdateAnimationControls();
         }
         finally
         {
@@ -703,6 +769,8 @@ public sealed class MainForm : Form
         st.RemoveBackground = _removeBg.Checked;
         st.Tolerance = (int)_tolerance.Value;
         st.BackgroundKey = SlotState.FormatColor(CurrentBgColor());
+        if (st.IsAnimated)
+            st.FrameDelayMs = Math.Clamp((int)_delayNum.Value, AniFile.MinDelayMs, AniFile.MaxDelayMs);
 
         if (_hotBox.SelectedIndex == 0)
         {
@@ -725,6 +793,107 @@ public sealed class MainForm : Form
         _tolerance.Enabled = on;
     }
 
+    // ================================================================ 动画
+
+    /// <summary>把动画那一行的控件同步成当前指针位的状态。调用点在 _loading 保护内，不会反过来触发事件。</summary>
+    private void UpdateAnimationControls()
+    {
+        var st = _ws.Peek(_current);
+        bool animated = st?.IsAnimated == true;
+
+        _delayNum.Enabled = animated;
+        _btnStatic.Enabled = animated;
+
+        if (!animated)
+        {
+            _delayNum.Value = Math.Clamp(st?.FrameDelayMs ?? AniFile.DefaultDelayMs,
+                                         AniFile.MinDelayMs, AniFile.MaxDelayMs);
+            _frameInfo.Text = st?.HasImage == true ? "静态（1 帧）" : "";
+            return;
+        }
+
+        _delayNum.Value = Math.Clamp(st!.FrameDelayMs, AniFile.MinDelayMs, AniFile.MaxDelayMs);
+        _frameInfo.Text = DescribeAnimation(st);
+    }
+
+    /// <summary>
+    /// 帧数和帧率。文案要短——这一格在最小窗口（940）下留给它的宽度有限，
+    /// 写长了标签会想折成两行，布局自检会报"文字可能显示不全"。
+    /// 「这个位置系统不播动画」那句放到状态栏去说。
+    /// </summary>
+    private string DescribeAnimation(SlotState st)
+    {
+        int fps = (int)Math.Round(1000.0 / Math.Max(1, st.FrameDelayMs));
+        string text = $"共 {st.FrameCount} 帧 · 约 {fps} fps";
+
+        // 系统只在「忙碌」和「后台运行」两个位置播放动画，别的位置传了 .ani 也只显示第一帧。
+        // 这是 Windows 的行为，不是本程序的限制
+        if (_current != "Wait" && _current != "AppStarting")
+            text += "（系统不播）";
+        return text;
+    }
+
+    private void OnAnimationChanged()
+    {
+        if (_loading) return;
+
+        var st = _ws.Peek(_current);
+        if (st?.IsAnimated != true) return;
+
+        st.FrameDelayMs = (int)_delayNum.Value;
+        _frameInfo.Text = DescribeAnimation(st);
+        RefreshPreview();       // 重开定时器，让新帧间隔立刻生效
+    }
+
+    /// <summary>把动画砍成一张静态图：只留第一帧。</summary>
+    private void DropAnimation()
+    {
+        var st = _ws.Peek(_current);
+        if (st?.IsAnimated != true) return;
+
+        int dropped = st.ExtraFrames!.Count;
+        st.ExtraFrames = null;
+        st.HotX = -1;   // 热点是按并集算的，帧集变了要重算
+        st.HotY = -1;
+
+        RefreshPreview();
+        RefreshSlotList();
+        SelectSlot(_current);
+        SetStatus($"已改成静态指针，丢掉了 {dropped} 帧。点「应用到系统」生效。");
+    }
+
+    /// <summary>定时器到点：换下一帧。</summary>
+    private void AdvancePreviewFrame()
+    {
+        var st = _ws.Peek(_current);
+        if (st?.IsAnimated != true)
+        {
+            _animTimer.Stop();
+            return;
+        }
+
+        _previewFrame = (_previewFrame + 1) % st.FrameCount;
+        ShowPreviewFrame(st);
+    }
+
+    /// <summary>只更新画布和"实际大小"两张图，不动其它控件——每 50ms 跑一次，要够轻。</summary>
+    private void ShowPreviewFrame(SlotState st)
+    {
+        var slot = CursorSlots.ByRegName(_current);
+        var sources = st.AllFrames();
+        if (slot is null || sources.Count == 0) return;
+
+        _previewFrame = Math.Clamp(_previewFrame, 0, sources.Count - 1);
+
+        var rs = st.ToRenderSettings();
+        var bmp = _cache.Render(sources[_previewFrame], rs, out _);
+        if (bmp is null) return;
+
+        Point hot = Store.ResolveHotSpot(st, slot, sources, _cache);
+        _canvas.SetImage(bmp, hot);
+        SwapActualImage(MakeActualPreview(bmp));
+    }
+
     // ================================================================ 预览
 
     private void RefreshPreview()
@@ -732,8 +901,11 @@ public sealed class MainForm : Form
         var st = _ws.Peek(_current);
         var slot = CursorSlots.ByRegName(_current);
 
+        _animTimer.Stop();
+
         if (st?.HasImage != true || slot is null)
         {
+            _previewFrame = 0;
             _canvas.SetImage(null, Point.Empty);
             SwapActualImage(MakePlaceholder());
             SetTryCursor(null);
@@ -742,8 +914,11 @@ public sealed class MainForm : Form
             return;
         }
 
+        var sources = st.AllFrames();
+        _previewFrame = Math.Clamp(_previewFrame, 0, sources.Count - 1);
+
         var rs = st.ToRenderSettings();
-        var bmp = _cache.Render(st.SourceImage!, rs, out string? err);
+        var bmp = _cache.Render(sources[_previewFrame], rs, out string? err);
 
         if (bmp is null)
         {
@@ -752,9 +927,7 @@ public sealed class MainForm : Form
             return;
         }
 
-        Point hot = rs.IsAutoHotSpot
-            ? Renderer.AutoHotSpot(bmp, slot.DefaultHotSpot)
-            : Renderer.RescaleHotSpot(rs.HotX, rs.HotY, st.Size, st.Size);
+        Point hot = Store.ResolveHotSpot(st, slot, sources, _cache);
 
         _canvas.SetImage(bmp, hot);
 
@@ -772,6 +945,14 @@ public sealed class MainForm : Form
         SetTryCursor(MakePreviewCursor(st, slot));
         UpdateScaleHint();
         UpdateStatus();
+
+        // 动画的话让画布自己转起来。「试一试」那块不用管——它拿到的是 .ani，
+        // 系统自己就会播，这也是"真的换成了动画指针"最直接的证据
+        if (st.IsAnimated)
+        {
+            _animTimer.Interval = Math.Clamp(st.FrameDelayMs, AniFile.MinDelayMs, AniFile.MaxDelayMs);
+            _animTimer.Start();
+        }
     }
 
     /// <summary>换图时先装新的再扔旧的：反过来的话 PictureBox 会有一瞬间指着已释放的图。</summary>
@@ -838,19 +1019,41 @@ public sealed class MainForm : Form
             var rs = st.ToRenderSettings();
             rs.Size = size;
 
-            var bmp = _cache.Render(st.SourceImage!, rs, out _);
-            if (bmp is null) return null;
+            var sources = st.AllFrames();
+            Point hot = Store.ResolveHotSpot(st, slot, sources, _cache);
 
-            Point hot = rs.IsAutoHotSpot
-                ? Renderer.AutoHotSpot(bmp, slot.DefaultHotSpot)
-                : Renderer.RescaleHotSpot(rs.HotX, rs.HotY, st.Size, size);
+            string ext;
+            string tmp;
 
-            string tmp = Path.Combine(dir, "building.cur");
-            CurFile.Write(tmp, new[] { new CurImage(bmp, hot.X, hot.Y) });
+            if (st.IsAnimated)
+            {
+                // 每帧装一个完整的 .cur，再套进 .ani 里交给 Windows 自己播。
+                // 「试一试」里动起来的那一下，就是应用到系统之后的样子
+                var frames = new List<byte[]>(sources.Count);
+                foreach (var src in sources)
+                {
+                    var fb = _cache.Render(src, rs, out _);
+                    if (fb is null) return null;
+                    frames.Add(CurFile.BuildBytes(new[] { new CurImage(fb, hot.X, hot.Y) }));
+                }
+
+                ext = ".ani";
+                tmp = Path.Combine(dir, "building.ani");
+                AniFile.Write(tmp, frames, size, st.FrameDelayMs);
+            }
+            else
+            {
+                var bmp = _cache.Render(sources[0], rs, out _);
+                if (bmp is null) return null;
+
+                ext = ".cur";
+                tmp = Path.Combine(dir, "building.cur");
+                CurFile.Write(tmp, new[] { new CurImage(bmp, hot.X, hot.Y) });
+            }
 
             string hash = Convert.ToHexString(
                 System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(tmp)))[..12];
-            string final = Path.Combine(dir, $"{slot.RegName}_{hash}.cur");
+            string final = Path.Combine(dir, $"{slot.RegName}_{hash}{ext}");
 
             if (!File.Exists(final)) File.Move(tmp, final, overwrite: true);
             else File.Delete(tmp);
@@ -893,7 +1096,8 @@ public sealed class MainForm : Form
         {
             string dir = Path.Combine(AppPaths.Root, "preview");
             if (!Directory.Exists(dir)) return;
-            foreach (var f in Directory.EnumerateFiles(dir, "*.cur"))
+            foreach (var pattern in new[] { "*.cur", "*.ani" })
+            foreach (var f in Directory.EnumerateFiles(dir, pattern))
             {
                 if (keep is not null && string.Equals(Path.GetFileName(f), keep, StringComparison.OrdinalIgnoreCase))
                     continue;
@@ -1035,20 +1239,48 @@ public sealed class MainForm : Form
     {
         using var dlg = new OpenFileDialog
         {
-            Title = "选一张图片作为鼠标指针",
-            Filter = ImageLoader.DialogFilter,
+            // 多选是给动画用的：挑一串按顺序排好的 PNG，就是一段动画。
+            // 单选一张静态图的行为和以前完全一样
+            Title = "选图片（GIF 会导成动画；也可以一次选多张当动画的帧）",
+            Filter = ImageLoader.FramesDialogFilter,
             CheckFileExists = true,
+            Multiselect = true,
         };
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
-        AssignImageFromFile(dlg.FileName);
+        AssignImagesFromFiles(dlg.FileNames);
     }
 
-    private void AssignImageFromFile(string path)
+    /// <summary>
+    /// 把一组文件导进来当一个指针位的图。
+    /// 一个文件里有多帧（GIF）就用它的全部帧；多选多个文件就按选择顺序当帧。
+    /// 两种情况合起来都指向同一件事：得到一个"帧列表"。
+    /// </summary>
+    private void AssignImagesFromFiles(IReadOnlyList<string> paths)
     {
-        string stored;
+        if (paths.Count == 0) return;
+
+        var storedFrames = new List<string>();
+        int delayMs = AniFile.DefaultDelayMs;
+        bool truncated = false;
+        string firstName = Path.GetFileName(paths[0]);
+
         try
         {
-            stored = Store.ImportImage(path);
+            foreach (var path in paths)
+            {
+                var loaded = ImageLoader.LoadFrames(path);
+                truncated |= loaded.Truncated;
+
+                // 多帧文件的延时用它自己的；多个文件各带各的延时时，取第一个有意义的
+                if (loaded.Frames.Count > 1 && delayMs == AniFile.DefaultDelayMs)
+                    delayMs = loaded.DelayMs;
+
+                foreach (var frame in loaded.Frames)
+                {
+                    try { storedFrames.Add(Store.ImportBitmap(frame)); }
+                    finally { frame.Dispose(); }
+                }
+            }
         }
         catch (Exception ex)
         {
@@ -1057,25 +1289,24 @@ public sealed class MainForm : Form
             return;
         }
 
-        var st = _ws.For(_current);
-        if (st.SourceImage is { } old && !string.Equals(old, stored, StringComparison.OrdinalIgnoreCase))
-            _cache.ForgetSource(old);
+        if (storedFrames.Count == 0)
+        {
+            SetStatus("这些文件里一帧都没读出来。", error: true);
+            return;
+        }
 
-        st.SourceImage = stored;
+        var st = _ws.For(_current);
+        foreach (var old in st.AllFrames())
+            if (!storedFrames.Contains(old, StringComparer.OrdinalIgnoreCase))
+                _cache.ForgetSource(old);
+
+        st.SetFrames(storedFrames);
+        st.FrameDelayMs = delayMs;
+        _previewFrame = 0;
         st.HotX = -1;
         st.HotY = -1;
 
-        // 白底图自动把抠图打开——导入截图/logo 时最常需要的就这一步，
-        // 但只有四个角确实是同一个不透明颜色时才敢这么干，不然会误伤照片
-        Color key = Color.White;
-        bool uniform = false;
-        try
-        {
-            using var bmp = ImageLoader.Load(stored);
-            (key, uniform) = Renderer.DetectBackground(bmp);
-        }
-        catch { /* 探测失败就用默认值，不拦着导入 */ }
-
+        bool uniform = DetectBackgroundOf(storedFrames[0], out var key);
         st.BackgroundKey = SlotState.FormatColor(key);
         st.RemoveBackground = uniform;
         if (uniform && st.Tolerance < 20) st.Tolerance = 30;
@@ -1084,9 +1315,39 @@ public sealed class MainForm : Form
         RefreshSlotList();
         SelectSlot(_current);
 
-        SetStatus($"已把「{Path.GetFileName(path)}」指定给「{CursorSlots.ByRegName(_current)?.DisplayName}」" +
-                  (uniform ? "，并自动识别到纯色背景、已开启抠图。" : "。可以点「应用到系统」了。"));
+        string what = st.IsAnimated
+            ? $"已导入 {st.FrameCount} 帧（{firstName} 等）作为动画指针"
+            : $"已把「{firstName}」指定给「{CursorSlots.ByRegName(_current)?.DisplayName}」";
+
+        string tail = st.IsAnimated
+            ? (_current is "Wait" or "AppStarting"
+                ? "，点「应用到系统」就能看到它动起来。"
+                : "。注意这个位置 Windows 不播放动画，只会显示第一帧。")
+            : (uniform ? "，并自动识别到纯色背景、已开启抠图。" : "。可以点「应用到系统」了。");
+
+        if (truncated) tail += $"（帧数超过 {AniFile.MaxFrames}，已均匀抽帧）";
+
+        SetStatus(what + tail);
     }
+
+    /// <summary>白底图自动把抠图打开——导入截图/logo 时最常需要的就这一步，只有真判定成纯色底才敢开。</summary>
+    private static bool DetectBackgroundOf(string storedPath, out Color key)
+    {
+        key = Color.White;
+        try
+        {
+            using var bmp = ImageLoader.Load(storedPath);
+            bool uniform;
+            (key, uniform) = Renderer.DetectBackground(bmp);
+            return uniform;
+        }
+        catch
+        {
+            return false;   // 探测失败就用默认值，不拦着导入
+        }
+    }
+
+    private void AssignImageFromFile(string path) => AssignImagesFromFiles(new[] { path });
 
     private void PasteFromClipboard()
     {
@@ -1140,6 +1401,9 @@ public sealed class MainForm : Form
             if (slot.RegName == _current) continue;
             var st = _ws.For(slot.RegName);
             st.SourceImage = src.SourceImage;
+            // 列表要复制一份，不能几个指针位共用同一个 List 对象
+            st.ExtraFrames = src.ExtraFrames is null ? null : new List<string>(src.ExtraFrames);
+            st.FrameDelayMs = src.FrameDelayMs;
             st.Size = src.Size;
             st.KeepAspect = src.KeepAspect;
             st.Scale = src.Scale;
@@ -1171,6 +1435,7 @@ public sealed class MainForm : Form
         if (ans != DialogResult.OK) return;
 
         st.SourceImage = null;
+        st.ExtraFrames = null;
         st.HotX = -1;
         st.HotY = -1;
 

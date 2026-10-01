@@ -36,6 +36,32 @@ public static class CurFile
     /// <summary>把一个或多个尺寸写成一个 .cur 文件。多个尺寸时 Windows 会挑最接近当前指针大小的那个用。</summary>
     public static void Write(string path, IReadOnlyList<CurImage> images)
     {
+        byte[] bytes = BuildBytes(images);
+
+        string full = Path.GetFullPath(path);
+        Directory.CreateDirectory(Path.GetDirectoryName(full)!);
+
+        // 先写临时文件再原子替换：中途失败也不会留半个坏文件在硬盘上
+        string tmp = full + ".tmp";
+        try
+        {
+            File.WriteAllBytes(tmp, bytes);
+            File.Move(tmp, full, overwrite: true);
+        }
+        catch
+        {
+            try { if (File.Exists(tmp)) File.Delete(tmp); } catch { /* 清理失败不该盖住真正的错 */ }
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// 只拼字节不落盘。
+    /// 写 .ani 时每一帧内部装的都是一个完整的 .cur，直接拿这里的结果塞进 icon 块就行，
+    /// 不必为了取字节再走一遍临时文件。
+    /// </summary>
+    public static byte[] BuildBytes(IReadOnlyList<CurImage> images)
+    {
         if (images.Count == 0)
             throw new ArgumentException("至少要有一帧", nameof(images));
         if (images.Count > 255)
@@ -48,46 +74,33 @@ public static class CurFile
             blobs[i] = BuildDib(images[i].Bitmap);
         }
 
-        string full = Path.GetFullPath(path);
-        Directory.CreateDirectory(Path.GetDirectoryName(full)!);
-
-        // 先写临时文件再原子替换：中途失败也不会留半个坏文件在硬盘上
-        string tmp = full + ".tmp";
-        try
+        using var ms = new MemoryStream();
+        using (var w = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true))
         {
-            using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
-            using (var w = new BinaryWriter(fs, Encoding.UTF8))
+            w.Write((ushort)0);            // idReserved
+            w.Write((ushort)2);            // idType：2 = 光标（图标是 1）
+            w.Write((ushort)images.Count); // idCount
+
+            int offset = DirSize + EntrySize * images.Count;
+            for (int i = 0; i < images.Count; i++)
             {
-                w.Write((ushort)0);            // idReserved
-                w.Write((ushort)2);            // idType：2 = 光标（图标是 1）
-                w.Write((ushort)images.Count); // idCount
-
-                int offset = DirSize + EntrySize * images.Count;
-                for (int i = 0; i < images.Count; i++)
-                {
-                    var bmp = images[i].Bitmap;
-                    // 256 要写成 0，这是格式里"用 1 个字节表示 256"的老规矩
-                    w.Write((byte)(bmp.Width >= 256 ? 0 : bmp.Width));
-                    w.Write((byte)(bmp.Height >= 256 ? 0 : bmp.Height));
-                    w.Write((byte)0);                        // bColorCount，真彩色填 0
-                    w.Write((byte)0);                        // bReserved
-                    w.Write((ushort)images[i].HotX);         // ← 光标格式：这里其实是热点 X
-                    w.Write((ushort)images[i].HotY);         // ← 光标格式：这里其实是热点 Y
-                    w.Write((uint)blobs[i].Length);
-                    w.Write((uint)offset);
-                    offset += blobs[i].Length;
-                }
-
-                foreach (var b in blobs) w.Write(b);
+                var bmp = images[i].Bitmap;
+                // 256 要写成 0，这是格式里"用 1 个字节表示 256"的老规矩
+                w.Write((byte)(bmp.Width >= 256 ? 0 : bmp.Width));
+                w.Write((byte)(bmp.Height >= 256 ? 0 : bmp.Height));
+                w.Write((byte)0);                        // bColorCount，真彩色填 0
+                w.Write((byte)0);                        // bReserved
+                w.Write((ushort)images[i].HotX);         // ← 光标格式：这里其实是热点 X
+                w.Write((ushort)images[i].HotY);         // ← 光标格式：这里其实是热点 Y
+                w.Write((uint)blobs[i].Length);
+                w.Write((uint)offset);
+                offset += blobs[i].Length;
             }
 
-            File.Move(tmp, full, overwrite: true);
+            foreach (var b in blobs) w.Write(b);
         }
-        catch
-        {
-            try { if (File.Exists(tmp)) File.Delete(tmp); } catch { /* 清理失败不该盖住真正的错 */ }
-            throw;
-        }
+
+        return ms.ToArray();
     }
 
     private static void Validate(CurImage img)
@@ -184,7 +197,15 @@ public static class CurFile
         byte[] raw;
         try { raw = File.ReadAllBytes(path); }
         catch { return null; }
+        return ReadFrame(raw, targetSize);
+    }
 
+    /// <summary>
+    /// 从内存里的字节读一帧。.ani 的每一帧内部就是一个完整 .cur，
+    /// 解帧时用这个重载，免得先落一次盘。
+    /// </summary>
+    public static CurFrame? ReadFrame(byte[] raw, int targetSize = 32)
+    {
         if (raw.Length < DirSize + EntrySize) return null;
         if (ReadU16(raw, 0) != 0) return null;
 
@@ -318,9 +339,11 @@ public static class CurFile
     // 下面这些只给自检用：把写出来的文件重新解析一遍，逐字段核对。
     // ------------------------------------------------------------------
 
-    public static CurInfo Inspect(string path)
+    public static CurInfo Inspect(string path) => Inspect(File.ReadAllBytes(path));
+
+    /// <summary>同 <see cref="Inspect(string)"/>，但直接吃内存里的字节（.ani 的帧就是这么检查的）。</summary>
+    public static CurInfo Inspect(byte[] raw)
     {
-        byte[] raw = File.ReadAllBytes(path);
         if (raw.Length < DirSize + EntrySize)
             throw new CurFormatException($"文件只有 {raw.Length} 字节，连目录都装不下");
 

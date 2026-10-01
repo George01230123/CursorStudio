@@ -71,6 +71,7 @@ internal static class SelfTest
         {
             SectionRenderer();
             SectionPipeline();
+            SectionAnimation();
             SectionCurFile();
             SectionSlots();
             SectionStockCursors();
@@ -454,6 +455,270 @@ internal static class SelfTest
         finally
         {
             bmp.UnlockBits(data);
+        }
+    }
+
+    // ================================================================ A3. 动画指针
+
+    /// <summary>
+    /// 动画这一整条链：GIF 导入 → 多帧状态 → 生成 .ani → 系统认不认 → 方案包里的 install.inf。
+    /// </summary>
+    private static void SectionAnimation()
+    {
+        Section("A3. 动画指针（.ani / GIF / install.inf）");
+
+        try
+        {
+            // ---- GIF 多帧导入 ----
+            string gif = Path.Combine(AppPaths.Root, "spin.gif");
+            File.WriteAllBytes(gif, TestImages.TinyAnimatedGif());
+
+            try
+            {
+                using var anim = ImageLoader.LoadFrames(gif);
+
+                Check(anim.Frames.Count == 3, "GIF 的 3 帧都读出来了", $"实际 {anim.Frames.Count}");
+                Check(anim.DelayMs == 120, "GIF 的帧延时读对了（12/100 秒 → 120ms）", $"实际 {anim.DelayMs}ms");
+
+                if (anim.Frames.Count == 3)
+                {
+                    Check(anim.Frames[0].GetPixel(0, 0).R > 200 && anim.Frames[0].GetPixel(0, 0).G < 60,
+                        "第 1 帧是红的（帧序没乱）", anim.Frames[0].GetPixel(0, 0).ToString());
+                    Check(anim.Frames[2].GetPixel(0, 0).B > 200 && anim.Frames[2].GetPixel(0, 0).R < 60,
+                        "第 3 帧是蓝的（帧序没乱）", anim.Frames[2].GetPixel(0, 0).ToString());
+                }
+            }
+            catch (Exception ex)
+            {
+                Fail("GIF 导入出错：" + ex.Message);
+            }
+
+            // ---- .ani 读写往返 ----
+            var frames = new List<byte[]>();
+            const int N = 4, SZ = 32;
+            for (int i = 0; i < N; i++)
+            {
+                using var bmp = TestImages.Solid(SZ, SZ, Color.FromArgb(255, (byte)(40 + i * 50), 60, 200));
+                frames.Add(CurFile.BuildBytes(new[] { new CurImage(bmp, 5, 7) }));
+            }
+
+            string aniPath = Path.Combine(AppPaths.Root, "roundtrip.ani");
+            AniFile.Write(aniPath, frames, SZ, 50);
+            Check(File.Exists(aniPath), "写出了 .ani 文件");
+
+            var info = AniFile.Inspect(aniPath);
+            Check(info is not null, "能读回 .ani 的头部");
+            if (info is not null)
+            {
+                Check(info.FrameCount == N, $"anih 里 nFrames={N}", $"实际 {info.FrameCount}");
+                Check(info.Steps == N, $"anih 里 nSteps={N}", $"实际 {info.Steps}");
+                Check(info.IconCount == N, $"LIST fram 里有 {N} 个 icon 块", $"实际 {info.IconCount}");
+                Check(info.FrameDelayMs == 50, "50ms 换算成 iDispRate=3 再换回来还是 50ms",
+                    $"实际 {info.FrameDelayMs}ms");
+                Check((info.Attributes & AniFile.AF_ICON) != 0, "bfAttributes 带上了 AF_ICON（不带系统不认）",
+                    $"实际 0x{info.Attributes:X}");
+            }
+
+            var back = AniFile.ReadFrames(aniPath, SZ);
+            Check(back is not null && back.Count == N, $"解回来还是 {N} 帧", $"实际 {back?.Count ?? -1}");
+
+            if (back is not null && back.Count == N)
+            {
+                Check(back.All(f => f.HotX == 5 && f.HotY == 7), "每帧的热点都原样带回来了");
+
+                bool samePixels = true;
+                for (int i = 0; i < N && samePixels; i++)
+                {
+                    var want = Color.FromArgb(255, (byte)(40 + i * 50), 60, 200);
+                    if (back[i].Image.GetPixel(10, 10) != want) samePixels = false;
+                }
+                Check(samePixels, "每帧的像素和写进去的一致（帧序没串）");
+
+                foreach (var f in back) f.Dispose();
+            }
+
+            // ---- 系统自带的 .ani 也要读得动 ----
+            string stock = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.Windows), "Cursors", "aero_busy.ani");
+            if (File.Exists(stock))
+            {
+                var si = AniFile.Inspect(stock);
+                Check(si is not null, "能读系统自带 aero_busy.ani 的头部");
+                if (si is not null)
+                {
+                    Check(si.IconCount == si.FrameCount && si.FrameCount > 1,
+                        $"系统文件的帧数和 icon 块数对得上（{si.FrameCount} 帧）",
+                        $"nFrames={si.FrameCount} icon={si.IconCount}");
+                    Check(Math.Abs(si.FrameDelayMs - 50) <= 2,
+                        "系统文件的 iDispRate=3 换回来是 50ms", $"实际 {si.FrameDelayMs}ms");
+                }
+
+                var sf = AniFile.ReadFrames(stock, 32, 3);   // 只解 3 帧，不用为了自检把 18 帧全解开
+                Check(sf is not null && sf.Count == 3, "能解出系统文件的前 3 帧", $"实际 {sf?.Count ?? -1}");
+                if (sf is not null)
+                {
+                    Check(sf[0].Image.Width == 32, "系统文件能按 32 尺寸解出来", $"实际 {sf[0].Image.Width}");
+                    foreach (var f in sf) f.Dispose();
+                }
+            }
+            else
+            {
+                Warn("系统里没有 aero_busy.ani，跳过实测");
+            }
+
+            // ---- Windows 认不认我们写的 .ani ----
+            Check(Win32.CanWindowsLoad(aniPath, 32), "Windows 的 LoadImage 能加载我们写的 .ani");
+
+            // ---- 走完整条生成路径 ----
+            var ws = new Workspace { SchemeName = "动画自检" };
+            var wait = ws.For("Wait");
+            var storedFrames = new List<string>();
+            using (var anim = ImageLoader.LoadFrames(gif))
+            {
+                foreach (var f in anim.Frames)
+                {
+                    try { storedFrames.Add(Store.ImportBitmap(f)); }
+                    finally { f.Dispose(); }
+                }
+                wait.SetFrames(storedFrames);
+                wait.FrameDelayMs = anim.DelayMs;
+            }
+            wait.Size = 32;
+
+            var arrow = ws.For("Arrow");
+            arrow.SourceImage = TestImages.SaveTemp(TestImages.DemoArrow(96), "ani-arrow.png");
+
+            Check(wait.IsAnimated && wait.FrameCount == 3, "动画位是 3 帧",
+                $"IsAnimated={wait.IsAnimated} FrameCount={wait.FrameCount}");
+
+            using var cache = new RenderCache();
+            var built = Store.BuildCursorFiles(ws, cache);
+            Check(built.Warnings.Count == 0, "生成过程没有警告", string.Join("；", built.Warnings));
+
+            string waitFile = built.Files.GetValueOrDefault("Wait") ?? "";
+            string arrowFile = built.Files.GetValueOrDefault("Arrow") ?? "";
+
+            Check(waitFile.EndsWith(".ani", StringComparison.OrdinalIgnoreCase),
+                "动画位生成的是 .ani", Path.GetFileName(waitFile));
+            Check(arrowFile.EndsWith(".cur", StringComparison.OrdinalIgnoreCase),
+                "静态位还是生成 .cur", Path.GetFileName(arrowFile));
+
+            if (waitFile.Length > 0)
+            {
+                var wi = AniFile.Inspect(waitFile);
+                Check(wi is not null && wi.FrameCount == 3, "生成的 .ani 里是 3 帧", $"实际 {wi?.FrameCount ?? -1}");
+
+                var wf = AniFile.ReadFrames(waitFile, 32);
+                if (wf is not null && wf.Count == 3)
+                {
+                    // 动画最要紧的一条：各帧热点不一样的话，系统播放时指针会在屏幕上抖
+                    Check(wf.All(f => f.HotX == wf[0].HotX && f.HotY == wf[0].HotY),
+                        "生成的动画所有帧共用一个热点（播放时不会抖）",
+                        string.Join(" / ", wf.Select(f => $"({f.HotX},{f.HotY})")));
+
+                    var firstBlob = AniFile.ReadIconBlob(waitFile, 0);
+                    if (firstBlob is not null)
+                    {
+                        var ci = CurFile.Inspect(firstBlob);
+                        Check(ci.Count == 4, "动画每一帧里都打包了 4 个尺寸（32/48/64/96）",
+                            "实际 " + string.Join("/", ci.Entries.Select(e => e.Width)));
+                    }
+                    foreach (var f in wf) f.Dispose();
+                }
+
+                Check(Win32.CanWindowsLoad(waitFile, 32), "Windows 认生成的 .ani");
+            }
+
+            // ---- 方案包里的 install.inf ----
+            string zip = Path.Combine(AppPaths.Root, "ani-pack.zip");
+            string copy = Path.Combine(AppPaths.Root, "ani-pack-copy.zip");
+            Store.ExportPack(ws, zip, built);
+
+            using (var z = System.IO.Compression.ZipFile.OpenRead(zip))
+            {
+                var e = z.GetEntry("install.inf");
+                Check(e is not null, "方案包里有 install.inf");
+
+                if (e is not null)
+                {
+                    string text;
+                    using (var s = e.Open())
+                    using (var r = new StreamReader(s, Encoding.Unicode, detectEncodingFromByteOrderMarks: true))
+                        text = r.ReadToEnd();
+
+                    Check(text.Contains("signature=\"$CHICAGO$\""), "install.inf 有 [Version] signature");
+                    Check(text.Contains("[DefaultInstall]") && text.Contains("AddReg"),
+                        "install.inf 有 DefaultInstall / AddReg");
+                    Check(text.Contains("Control Panel\\Cursors\\Schemes"), "install.inf 往 Schemes 里写方案");
+                    Check(text.Contains("Wait.ani") && text.Contains("Arrow.cur"),
+                        "install.inf 引用的文件名和包里的对得上");
+
+                    // 光进方案列表还不够，还要顺手把这套指针设为当前指针
+                    Check(text.Contains("[Scheme.Apply]") &&
+                          text.Contains("HKCU,\"Control Panel\\Cursors\",Arrow,0x00020000,"),
+                        "install.inf 把指针位也真的设成了当前使用的");
+                    Check(text.Contains("HKCU,\"Control Panel\\Cursors\",Wait,0x00020000,"),
+                        "动画位同样被设为当前指针");
+                    // 没配图的指针位不该去动
+                    Check(!text.Contains("HKCU,\"Control Panel\\Cursors\",Hand,0x00020000,"),
+                        "没配图的指针位没有被写进注册表");
+
+                    // Schemes 是一串逗号分隔、顺序固定的路径，段数错了指针位就整体张冠李戴
+                    var m = System.Text.RegularExpressions.Regex.Match(text, "Schemes\",\"[^\"]+\",,\"([^\"]*)\"");
+                    if (!m.Success) Fail("install.inf 里的 Schemes 值没找到");
+                    else
+                    {
+                        var parts = m.Groups[1].Value.Split(',');
+                        Check(parts.Length == CursorSlots.All.Count,
+                            $"Schemes 里有 {CursorSlots.All.Count} 段（一个指针位一段）", $"实际 {parts.Length} 段");
+                        // 路径是 %10%\%CUR_DIR%\%<注册表值名>%，真正的文件名在 [Strings] 里
+                        Check(parts.Length > 3 && parts[0] == @"%10%\%CUR_DIR%\%Arrow%",
+                            "第 1 段是「正常选择」", parts.Length > 0 ? parts[0] : "");
+                        Check(parts.Length > 3 && parts[3] == @"%10%\%CUR_DIR%\%Wait%",
+                            "第 4 段是「忙碌」（顺序没错位）", parts.Length > 3 ? parts[3] : "");
+                        Check(parts.Length > 1 && parts[1].Length == 0, "没配的指针位留空",
+                            parts.Length > 1 ? $"[{parts[1]}]" : "");
+                    }
+
+                    // UTF-16LE BOM：方案名可能是中文，ANSI 的 inf 换个语言版本就乱码
+                    bool bom;
+                    using (var s = e.Open())
+                    {
+                        var head = new byte[2];
+                        bom = s.Read(head, 0, 2) == 2 && head[0] == 0xFF && head[1] == 0xFE;
+                    }
+                    Check(bom, "install.inf 是 UTF-16LE 带 BOM（中文方案名不会乱码）");
+                }
+
+                Check(z.Entries.Any(x => x.FullName == "cursors/Wait.ani"), "包里带了 .ani 成品");
+                int frameImages = z.Entries.Count(x => x.FullName.StartsWith("images/Wait_"));
+                Check(frameImages == 3, "动画的 3 帧源图都进了包", $"实际 {frameImages}");
+
+                var un = z.GetEntry("uninstall.bat");
+                Check(un is not null, "方案包里有 uninstall.bat");
+                if (un is not null)
+                {
+                    using var s = un.Open();
+                    using var r = new StreamReader(s, Encoding.UTF8);
+                    string bat = r.ReadToEnd();
+                    Check(bat.Contains("reg delete") && bat.Contains("Cursors\\Schemes"),
+                        "uninstall.bat 删的是方案列表那一条");
+                }
+
+                File.Copy(zip, copy, overwrite: true);
+            }
+
+            // ---- 导出再导入，动画不能退化成单帧 ----
+            var imported = Store.ImportPack(copy);
+            var importedWait = imported.Peek("Wait");
+            Check(imported.MissingImages.Count == 0, "导入方案包时源图一张没丢",
+                string.Join("、", imported.MissingImages));
+            Check(importedWait?.IsAnimated == true && importedWait.FrameCount == 3,
+                "导入回来还是 3 帧的动画", $"FrameCount={importedWait?.FrameCount ?? 0}");
+        }
+        catch (Exception ex)
+        {
+            Fail("动画测试出错：" + ex);
         }
     }
 
@@ -1199,6 +1464,72 @@ internal static class TestImages
         using var g = Graphics.FromImage(bmp);
         g.Clear(c);
         return bmp;
+    }
+
+    /// <summary>把一张图存到自检的临时根目录里，返回路径。</summary>
+    public static string SaveTemp(Bitmap bmp, string name)
+    {
+        string path = Path.Combine(AppPaths.Root, name);
+        bmp.Save(path, ImageFormat.Png);
+        return path;
+    }
+
+    /// <summary>
+    /// 手搓一个 3 帧的 GIF（红 / 绿 / 蓝，每帧 12/100 秒）。
+    ///
+    /// 为什么不用 GDI+ 的 GIF 编码器造测试数据：它写出来的多帧 GIF，
+    /// **它自己的解码器只数得出 1 帧**——实测文件里明明有 6 个图形控制扩展，
+    /// 但 GetFrameCount(FrameDimension.Time) 返回 1。自检要的是确定性，
+    /// 所以按 GIF89a 规范直接拼字节，不依赖编码器。
+    /// </summary>
+    public static byte[] TinyAnimatedGif()
+    {
+        var ms = new MemoryStream();
+        void U8(int v) => ms.WriteByte((byte)v);
+        void U16(int v) { ms.WriteByte((byte)(v & 0xFF)); ms.WriteByte((byte)((v >> 8) & 0xFF)); }
+        void Ascii(string s) => ms.Write(Encoding.ASCII.GetBytes(s), 0, s.Length);
+
+        Ascii("GIF89a");
+        U16(2); U16(2);                 // 逻辑屏幕 2×2
+        U8(0x80 | 0x01);                // 有全局色表，2^(1+1)=4 项
+        U8(0); U8(0);                   // 背景色索引、像素宽高比
+        U8(255); U8(0); U8(0);          // 0 红
+        U8(0); U8(255); U8(0);          // 1 绿
+        U8(0); U8(0); U8(255);          // 2 蓝
+        U8(0); U8(0); U8(0);            // 3 黑
+
+        // Netscape 循环扩展
+        U8(0x21); U8(0xFF); U8(0x0B); Ascii("NETSCAPE2.0"); U8(0x03); U8(0x01); U16(0); U8(0x00);
+
+        for (int f = 0; f < 3; f++)
+        {
+            // 图形控制扩展：处置方式 1（不处置），延时 12/100 秒
+            U8(0x21); U8(0xF9); U8(0x04); U8(0x04); U16(12); U8(0); U8(0x00);
+            U8(0x2C); U16(0); U16(0); U16(2); U16(2); U8(0x00);   // 图像描述符
+
+            // LZW 最简流：clear=4，四个像素都是索引 f，end=5，定长 3 位
+            var bits = new List<int>();
+            void Code(int c, int n) { for (int b = 0; b < n; b++) bits.Add((c >> b) & 1); }
+            Code(4, 3);
+            Code(f, 3); Code(f, 3); Code(f, 3); Code(f, 3);
+            Code(5, 3);
+
+            var packed = new List<byte>();
+            for (int i = 0; i < bits.Count; i += 8)
+            {
+                int v = 0;
+                for (int b = 0; b < 8 && i + b < bits.Count; b++) v |= bits[i + b] << b;
+                packed.Add((byte)v);
+            }
+
+            U8(2);                          // minCodeSize（GIF 最小就是 2）
+            U8(packed.Count);
+            foreach (var b in packed) U8(b);
+            U8(0x00);                       // 子块结束
+        }
+
+        U8(0x3B);                           // trailer
+        return ms.ToArray();
     }
 
     /// <summary>白底 + 正中间一个红圆。用来验证抠背景。</summary>

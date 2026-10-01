@@ -1,4 +1,5 @@
 using System.Drawing;
+using System.Drawing.Imaging;
 
 namespace CursorStudio.Core;
 
@@ -181,8 +182,29 @@ public static class ImageLoader
     /// <summary>能导入的格式。GDI+ 自带这些；WebP 不在其中，系统不带解码器。</summary>
     public const string DialogFilter =
         "图片文件|*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff;*.ico|" +
-        "PNG|*.png|JPEG|*.jpg;*.jpeg|BMP|*.bmp|GIF（只取第一帧）|*.gif|" +
+        "PNG|*.png|JPEG|*.jpg;*.jpeg|BMP|*.bmp|GIF（多帧会导成动画指针）|*.gif|" +
         "TIFF|*.tif;*.tiff|图标|*.ico|所有文件|*.*";
+
+    /// <summary>多选时能一次挑一堆图当动画的帧。</summary>
+    public const string FramesDialogFilter =
+        "图片文件|*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff;*.ico|所有文件|*.*";
+
+    /// <summary>GIF 每帧延时的属性标签，值是 4 字节一组，单位 1/100 秒。</summary>
+    private const int PropertyTagFrameDelay = 0x5100;
+
+    /// <summary>
+    /// 一次动画导入的结果。
+    /// 里面的位图归调用方，Dispose 这个对象就会把它们一起放掉——
+    /// 一帧一张位图，忘了放很容易在大 GIF 上把内存吃满。
+    /// </summary>
+    public sealed record AnimationLoad(List<Bitmap> Frames, int DelayMs, bool Truncated) : IDisposable
+    {
+        public void Dispose()
+        {
+            foreach (var f in Frames) f.Dispose();
+            Frames.Clear();
+        }
+    }
 
     /// <summary>
     /// 从文件读图。
@@ -195,18 +217,7 @@ public static class ImageLoader
         if (!File.Exists(path))
             throw new FileNotFoundException($"找不到文件：{path}");
 
-        byte[] bytes;
-        try
-        {
-            bytes = File.ReadAllBytes(path);
-        }
-        catch (Exception ex)
-        {
-            throw new InvalidOperationException($"读不了这个文件（可能被别的程序占用）：{ex.Message}");
-        }
-
-        if (bytes.Length == 0)
-            throw new InvalidOperationException("文件是空的");
+        byte[] bytes = ReadBytes(path);
 
         try
         {
@@ -226,6 +237,118 @@ public static class ImageLoader
             throw new InvalidOperationException(
                 "解不开这个图片格式。支持 PNG / JPG / BMP / GIF / TIFF / ICO——" +
                 "WebP 和 AVIF 系统不带解码器，请先转成 PNG 再导入。");
+        }
+    }
+
+    private static byte[] ReadBytes(string path)
+    {
+        byte[] bytes;
+        try
+        {
+            bytes = File.ReadAllBytes(path);
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException($"读不了这个文件（可能被别的程序占用）：{ex.Message}");
+        }
+
+        if (bytes.Length == 0)
+            throw new InvalidOperationException("文件是空的");
+        return bytes;
+    }
+
+    /// <summary>
+    /// 读一个文件里的所有帧。
+    /// 静态图就只有一帧；GIF 有多少帧读多少帧（超过 <paramref name="maxFrames"/> 就均匀抽帧）。
+    ///
+    /// GDI+ 的 SelectActiveFrame 会把每一帧按 GIF 自己的处置方式合成到画布上，
+    /// 所以拿到的就是"眼睛看到的第 N 帧"，不用自己拼。
+    /// </summary>
+    public static AnimationLoad LoadFrames(string path, int maxFrames = AniFile.MaxFrames)
+    {
+        if (!File.Exists(path))
+            throw new FileNotFoundException($"找不到文件：{path}");
+
+        byte[] bytes = ReadBytes(path);
+        var frames = new List<Bitmap>();
+
+        try
+        {
+            using var ms = new MemoryStream(bytes, writable: false);
+            using var img = Image.FromStream(ms, useEmbeddedColorManagement: false, validateImageData: true);
+
+            int total = 1;
+            try
+            {
+                if (img.RawFormat.Guid == ImageFormat.Gif.Guid)
+                    total = img.GetFrameCount(FrameDimension.Time);
+            }
+            catch { total = 1; }
+            if (total < 1) total = 1;
+
+            int keep = Math.Min(total, Math.Max(1, maxFrames));
+            bool truncated = keep < total;
+
+            // 超过上限就均匀抽帧，而不是掐掉尾巴——抽帧至少还能看出整个动作
+            for (int i = 0; i < keep; i++)
+            {
+                int index = truncated ? (int)((long)i * total / keep) : i;
+                if (total > 1) img.SelectActiveFrame(FrameDimension.Time, index);
+                var bmp = new Bitmap(img);
+                if (bmp.Width == 0 || bmp.Height == 0)
+                {
+                    bmp.Dispose();
+                    continue;
+                }
+                frames.Add(bmp);
+            }
+
+            int delay = ReadGifDelay(img, total);
+            if (frames.Count == 0) throw new InvalidOperationException("这个文件里一帧都没解出来");
+            return new AnimationLoad(frames, delay, truncated);
+        }
+        catch (InvalidOperationException)
+        {
+            foreach (var f in frames) f.Dispose();
+            throw;
+        }
+        catch
+        {
+            foreach (var f in frames) f.Dispose();
+            throw new InvalidOperationException(
+                "解不开这个图片格式。支持 PNG / JPG / BMP / GIF / TIFF / ICO——" +
+                "WebP 和 AVIF 系统不带解码器，请先转成 PNG 再导入。");
+        }
+    }
+
+    /// <summary>
+    /// 取 GIF 的帧延时，换算成毫秒。
+    /// 很多 GIF 会把延时写成 0（"尽可能快"），浏览器一律当成 100ms；这里同理，
+    /// 并夹到指针合理的区间——太快看不清，太慢就不像"忙"了。
+    /// </summary>
+    private static int ReadGifDelay(Image img, int total)
+    {
+        try
+        {
+            if (img.RawFormat.Guid != ImageFormat.Gif.Guid || total <= 1) return AniFile.DefaultDelayMs;
+
+            var prop = img.GetPropertyItem(PropertyTagFrameDelay);
+            if (prop?.Value is null || prop.Value.Length < 4) return AniFile.DefaultDelayMs;
+
+            long sum = 0;
+            int n = Math.Min(total, prop.Value.Length / 4);
+            for (int i = 0; i < n; i++)
+            {
+                int hundredths = BitConverter.ToInt32(prop.Value, i * 4);
+                sum += hundredths <= 1 ? 100 : hundredths * 10;   // 0 和 1 都按 100ms 算
+            }
+            if (n == 0) return AniFile.DefaultDelayMs;
+
+            return Math.Clamp((int)(sum / n), AniFile.MinDelayMs, AniFile.MaxDelayMs);
+        }
+        catch
+        {
+            return AniFile.DefaultDelayMs;
         }
     }
 }

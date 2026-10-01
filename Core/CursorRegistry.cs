@@ -159,11 +159,34 @@ public static class CursorRegistry
         // 2 = 系统方案
         key.SetValue("Scheme Source", 2, RegistryValueKind.DWord);
         key.SetValue("",
-            wasSystemScheme && !string.IsNullOrWhiteSpace(existingName) ? existingName : "Windows 默认",
+            wasSystemScheme && !string.IsNullOrWhiteSpace(existingName) ? existingName : DefaultSchemeName(),
             RegistryValueKind.String);
 
         key.Flush();
         Win32.BroadcastCursorChange();
+    }
+
+    /// <summary>
+    /// 系统方案该叫什么名字。这个字符串只是显示在「鼠标属性」的下拉框里，
+    /// 但以前是写死的中文"Windows 默认"——英文版 Windows 上会显示成中文，很出戏。
+    /// 能沿用注册表里原有的名字就沿用，实在没有才按系统语言给一个。
+    /// </summary>
+    private static string DefaultSchemeName()
+    {
+        try
+        {
+            using var key = OpenRead();
+            // Schemes 里的第一条一般就是系统默认方案，它的名字是本地化的
+            using var schemes = Registry.CurrentUser.OpenSubKey(@"Control Panel\Cursors\Schemes");
+            string? first = schemes?.GetValueNames()
+                .FirstOrDefault(n => !string.IsNullOrWhiteSpace(n));
+            if (!string.IsNullOrWhiteSpace(first)) return first!;
+        }
+        catch { /* 读不到就退回按语言猜 */ }
+
+        return System.Globalization.CultureInfo.CurrentUICulture.TwoLetterISOLanguageName == "zh"
+            ? "Windows 默认"
+            : "Windows Default";
     }
 
     /// <summary>先找带后缀的（_l / _xl），没有就退回不带后缀的；再没有就返回 null。</summary>

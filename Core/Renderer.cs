@@ -319,10 +319,12 @@ public static class Renderer
 
         // 阴影就是"把图形的不透明区域涂成半透明黑"
         var mask = new Bitmap(n, n, PixelFormat.Format32bppArgb);
-        var data = src.LockBits(new Rectangle(0, 0, n, n), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
-        var md = mask.LockBits(new Rectangle(0, 0, n, n), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+        BitmapData? data = null, md = null;
         try
         {
+            data = src.LockBits(new Rectangle(0, 0, n, n), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+            md = mask.LockBits(new Rectangle(0, 0, n, n), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+
             int len = data.Stride * n;
             var srcBuf = new byte[len];
             Marshal.Copy(data.Scan0, srcBuf, 0, len);
@@ -335,10 +337,17 @@ public static class Renderer
             }
             Marshal.Copy(dstBuf, 0, md.Scan0, dstBuf.Length);
         }
+        catch
+        {
+            // 锁失败时 mask 还没交出去，这里自己收拾，别把一张位图漏在外面
+            mask.Dispose();
+            throw;
+        }
         finally
         {
-            src.UnlockBits(data);
-            mask.UnlockBits(md);
+            // data / md 可能只锁上了一个，各自判一下再解
+            if (data is not null) src.UnlockBits(data);
+            if (md is not null) mask.UnlockBits(md);
         }
 
         using (var blurred = BoxBlurAlpha(mask, blur))
@@ -455,6 +464,69 @@ public static class Renderer
         }
 
         return new Point(0, 0);
+    }
+
+    /// <summary>
+    /// 把多帧叠成一张"逐像素取最大 alpha"的并集图，只用来定热点。
+    ///
+    /// 动画指针必须**所有帧共用一个热点**：系统是逐帧取热点坐标的，
+    /// 每帧各算各的会让指针在屏幕上抖，手感比不好看难受得多。
+    ///
+    /// 这里不能用 GDI+ 一帧帧往上画：SourceOver 的 alpha 是 a₂ + a₁(1−a₂) 而不是取大值，
+    /// 边缘会越叠越实，"最靠左上的不透明像素"可能落在任何一帧上都不存在的位置。
+    /// </summary>
+    public static Bitmap UnionAlpha(IReadOnlyList<Bitmap> frames)
+    {
+        if (frames.Count == 0) throw new ArgumentException("至少要有一帧", nameof(frames));
+
+        int w = frames[0].Width, h = frames[0].Height;
+        var union = new Bitmap(w, h, PixelFormat.Format32bppArgb);
+
+        var dst = union.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+        try
+        {
+            int stride = dst.Stride;
+            var acc = new byte[stride * h];
+
+            foreach (var f in frames)
+            {
+                var d = f.LockBits(new Rectangle(0, 0, f.Width, f.Height),
+                                   ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+                try
+                {
+                    var row = new byte[Math.Abs(d.Stride)];
+                    int absStride = Math.Abs(d.Stride);
+                    for (int y = 0; y < h; y++)
+                    {
+                        int srcRow = d.Stride >= 0 ? y : h - 1 - y;
+                        Marshal.Copy(IntPtr.Add(d.Scan0, srcRow * absStride), row, 0, row.Length);
+                        int dstRow = y * stride;
+                        for (int x = 0; x < w; x++)
+                        {
+                            byte a = row[x * 4 + 3];
+                            if (a <= acc[dstRow + x * 4 + 3]) continue;
+                            // 用这一帧的整像素覆盖，保证颜色和 alpha 是配套的
+                            acc[dstRow + x * 4] = row[x * 4];
+                            acc[dstRow + x * 4 + 1] = row[x * 4 + 1];
+                            acc[dstRow + x * 4 + 2] = row[x * 4 + 2];
+                            acc[dstRow + x * 4 + 3] = a;
+                        }
+                    }
+                }
+                finally
+                {
+                    f.UnlockBits(d);
+                }
+            }
+
+            Marshal.Copy(acc, 0, dst.Scan0, acc.Length);
+        }
+        finally
+        {
+            union.UnlockBits(dst);
+        }
+
+        return union;
     }
 
     /// <summary>换尺寸时按比例搬运手点的热点。</summary>
