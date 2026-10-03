@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Drawing;
 using System.Drawing.Imaging;
 
@@ -28,8 +29,8 @@ public sealed class RenderCache : IDisposable
     private const int MaxRendered = 64;
 
     private readonly Dictionary<string, Bitmap> _working = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, Bitmap> _keyed = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, Bitmap> _rendered = new(StringComparer.Ordinal);
+    private readonly BitmapCache _keyed = new(StringComparer.Ordinal);
+    private readonly BitmapCache _rendered = new(StringComparer.Ordinal);
 
     // ---------------- 源图 ----------------
 
@@ -68,11 +69,10 @@ public sealed class RenderCache : IDisposable
     private Bitmap GetKeyed(Bitmap working, string sourcePath, RenderSettings s)
     {
         string key = string.Join('|', sourcePath, s.BackgroundKey.ToArgb(), s.Tolerance);
-        if (_keyed.TryGetValue(key, out var hit)) return hit;
+        if (_keyed.TryGet(key, out var hit)) return hit;
 
         var keyed = Renderer.KeyOutBackground(working, s.BackgroundKey, s.Tolerance);
-        Evict(_keyed, max: 6);
-        _keyed[key] = keyed;
+        _keyed.Add(key, keyed, max: 6);
         return keyed;
     }
 
@@ -85,7 +85,7 @@ public sealed class RenderCache : IDisposable
             sourcePath, s.Size, s.KeepAspect, s.RemoveBackground,
             s.BackgroundKey.ToArgb(), s.Tolerance, s.Scale, s.Shadow);
 
-        if (_rendered.TryGetValue(key, out var cached))
+        if (_rendered.TryGet(key, out var cached))
         {
             error = null;
             return cached;
@@ -102,9 +102,29 @@ public sealed class RenderCache : IDisposable
         // 拼漏一个参数，界面上的开关就会变成摆设
         var result = Renderer.Compose(src, s);
 
-        Evict(_rendered, MaxRendered);
-        _rendered[key] = result;
+        _rendered.Add(key, result, MaxRendered);
         return result;
+    }
+
+    /// <summary>
+    /// 渲染一张并**把所有权交给调用方**（不进渲染缓存）。用完必须 Dispose。
+    ///
+    /// 批量生成 .cur/.ani 必须走这个，不能用 <see cref="Render"/>：
+    /// 那种场景每个 (帧, 尺寸) 组合只会渲染一次，进缓存纯属白费；更要命的是缓存有上限、满了要淘汰，
+    /// 而同一帧的 32 尺寸是在"定热点"那一趟先进缓存的，比它自己的 48/64/96 尺寸都早——
+    /// 于是渲染后三个尺寸时正好把这一帧的 32 尺寸淘汰掉，接着 BuildBytes 读像素
+    /// 就是 GDI+ 的 <c>Parameter is not valid</c>。60 帧动画会稳定踩中。
+    /// </summary>
+    public Bitmap? RenderOwned(string sourcePath, RenderSettings s, out string? error)
+    {
+        var working = GetWorking(sourcePath, out error);
+        if (working is null) return null;
+
+        var src = s.RemoveBackground && s.Tolerance > 0
+            ? GetKeyed(working, sourcePath, s)
+            : working;
+
+        return Renderer.Compose(src, s);
     }
 
     // ---------------- 失效 ----------------
@@ -113,15 +133,15 @@ public sealed class RenderCache : IDisposable
     public void ForgetSource(string sourcePath)
     {
         DropWhere(_working, k => k.Equals(sourcePath, StringComparison.OrdinalIgnoreCase));
-        DropWhere(_keyed, k => k.StartsWith(sourcePath + "|", StringComparison.OrdinalIgnoreCase));
-        DropWhere(_rendered, k => k.StartsWith(sourcePath + "|", StringComparison.OrdinalIgnoreCase));
+        _keyed.DropWhere(k => k.StartsWith(sourcePath + "|", StringComparison.OrdinalIgnoreCase));
+        _rendered.DropWhere(k => k.StartsWith(sourcePath + "|", StringComparison.OrdinalIgnoreCase));
     }
 
     public void Clear()
     {
         DropWhere(_working, _ => true);
-        DropWhere(_keyed, _ => true);
-        DropWhere(_rendered, _ => true);
+        _keyed.DropWhere(_ => true);
+        _rendered.DropWhere(_ => true);
     }
 
     private static void DropWhere(Dictionary<string, Bitmap> map, Func<string, bool> predicate)
@@ -133,13 +153,53 @@ public sealed class RenderCache : IDisposable
         }
     }
 
-    private static void Evict(Dictionary<string, Bitmap> map, int max)
+    /// <summary>
+    /// 定长 FIFO 缓存，淘汰的一定是最早放进去的那张。
+    ///
+    /// 这里不能用 <c>Dictionary</c> 加一句"Keys.First() 就是最旧的"：Dictionary 的枚举顺序
+    /// **不是插入顺序**，删过元素之后（复用空闲槽位）就更乱，于是"淘汰最旧的"实际上变成了
+    /// 随机淘汰——把调用方还拿在手里的位图 Dispose 掉，下一句读像素就是 GDI+ 的
+    /// <c>Parameter is not valid</c>。
+    ///
+    /// 这个坑是 60 帧动画暴露出来的：那种规模一定会把缓存塞满，于是必然踩中；
+    /// 而自检里原来最多只造 3 帧，缓存根本到不了上限，所以一直没被发现。
+    /// </summary>
+    private sealed class BitmapCache(IEqualityComparer<string> comparer)
     {
-        while (map.Count >= max)
+        private readonly Dictionary<string, Bitmap> _map = new(comparer);
+        private readonly LinkedList<string> _order = new();
+
+        public bool TryGet(string key, [NotNullWhen(true)] out Bitmap? bmp) => _map.TryGetValue(key, out bmp);
+
+        /// <summary>放进去，必要时先淘汰最旧的，保证总数不超过 <paramref name="max"/>。</summary>
+        public void Add(string key, Bitmap bmp, int max)
         {
-            var oldest = map.Keys.First();
-            map[oldest].Dispose();
-            map.Remove(oldest);
+            if (_map.ContainsKey(key))
+            {
+                _map[key].Dispose();
+                _map[key] = bmp;      // 位置不变：它还是原来那个"新旧"
+                return;
+            }
+
+            while (_map.Count >= max && _order.First is not null)
+            {
+                string oldest = _order.First.Value;
+                _order.RemoveFirst();
+                if (_map.Remove(oldest, out var victim)) victim.Dispose();
+            }
+
+            _map[key] = bmp;
+            _order.AddLast(key);
+        }
+
+        public void DropWhere(Func<string, bool> predicate)
+        {
+            foreach (var key in _map.Keys.Where(predicate).ToList())
+            {
+                _map[key].Dispose();
+                _map.Remove(key);
+                _order.Remove(key);
+            }
         }
     }
 

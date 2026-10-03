@@ -629,6 +629,50 @@ internal static class SelfTest
                 Check(Win32.CanWindowsLoad(waitFile, 32), "Windows 认生成的 .ani");
             }
 
+            // ---- 大动画：帧数一多就会把渲染缓存塞满，专门踩一下那个上限 ----
+            // 缓存淘汰原来拿 Dictionary.Keys.First() 当"最旧的"，而 Dictionary 的枚举顺序
+            // 不是插入顺序、删过元素后更乱，于是会随机淘汰掉调用方正在用的位图，
+            // 报出来是 "写文件失败 — Parameter is not valid"。帧数少的时候缓存到不了上限，
+            // 所以只有这种规模的用例才拦得住。
+            var big = new Workspace { SchemeName = "大动画" };
+            // 用「后台运行」而不是「忙碌」：同一个指针位重新生成时会把旧文件清掉，
+            // 用同一个位会把上面 3 帧测试的产物删掉，下面方案包那段就找不到文件了
+            var bigSlot = big.For("AppStarting");
+            var bigFrames = new List<string>();
+            for (int i = 0; i < AniFile.MaxFrames; i++)
+            {
+                using var bmp = TestImages.Spinner(64, i, AniFile.MaxFrames);
+                bigFrames.Add(Store.ImportBitmap(bmp));
+            }
+            bigSlot.SetFrames(bigFrames);
+            bigSlot.Size = 32;
+            bigSlot.FrameDelayMs = 50;
+
+            using (var bigCache = new RenderCache())
+            {
+                var bigBuilt = Store.BuildCursorFiles(big, bigCache);
+                Check(bigBuilt.Warnings.Count == 0,
+                    $"{AniFile.MaxFrames} 帧动画生成时一条警告都没有（把渲染缓存塞满也不出错）",
+                    string.Join("；", bigBuilt.Warnings));
+
+                string bigAni = bigBuilt.Files.GetValueOrDefault("AppStarting") ?? "";
+                var bigInfo = bigAni.Length > 0 ? AniFile.Inspect(bigAni) : null;
+                Check(bigInfo?.FrameCount == AniFile.MaxFrames,
+                    $"生成的 .ani 里 {AniFile.MaxFrames} 帧一个不少", $"实际 {bigInfo?.FrameCount ?? -1}");
+
+                if (bigAni.Length > 0)
+                {
+                    var bigRead = AniFile.ReadFrames(bigAni, 32, 4);
+                    if (bigRead is not null)
+                    {
+                        Check(bigRead.All(f => f.HotX == bigRead[0].HotX && f.HotY == bigRead[0].HotY),
+                            "60 帧动画的热点也是共用的");
+                        foreach (var f in bigRead) f.Dispose();
+                    }
+                    Check(Win32.CanWindowsLoad(bigAni, 32), "系统认这个 60 帧的 .ani");
+                }
+            }
+
             // ---- 方案包里的 install.inf ----
             string zip = Path.Combine(AppPaths.Root, "ani-pack.zip");
             string copy = Path.Combine(AppPaths.Root, "ani-pack-copy.zip");
@@ -1463,6 +1507,22 @@ internal static class TestImages
         var bmp = new Bitmap(w, h, PixelFormat.Format32bppArgb);
         using var g = Graphics.FromImage(bmp);
         g.Clear(c);
+        return bmp;
+    }
+
+    /// <summary>
+    /// 一帧转圈的扇形，用来造大动画。
+    /// 每帧图形的位置都不一样，所以"所有帧共用一个热点"这件事是真的被考到了。
+    /// </summary>
+    public static Bitmap Spinner(int size, int frame, int total)
+    {
+        var bmp = new Bitmap(size, size, PixelFormat.Format32bppArgb);
+        using var g = Graphics.FromImage(bmp);
+        g.Clear(Color.Transparent);
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        using var pen = new Pen(Color.FromArgb(255, 20, 120, 220), size * 0.16f);
+        g.DrawArc(pen, size * 0.15f, size * 0.15f, size * 0.7f, size * 0.7f,
+                  frame * (360 / Math.Max(1, total)), 270);
         return bmp;
     }
 

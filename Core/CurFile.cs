@@ -34,14 +34,15 @@ public static class CurFile
     internal const int HeaderSize = 40;
 
     /// <summary>把一个或多个尺寸写成一个 .cur 文件。多个尺寸时 Windows 会挑最接近当前指针大小的那个用。</summary>
-    public static void Write(string path, IReadOnlyList<CurImage> images)
-    {
-        byte[] bytes = BuildBytes(images);
+    public static void Write(string path, IReadOnlyList<CurImage> images) =>
+        WriteBytes(path, BuildBytes(images));
 
+    /// <summary>把已经拼好的 .cur 字节原子地落盘（先写临时文件再替换，中途失败不会留半个坏文件）。</summary>
+    public static void WriteBytes(string path, byte[] bytes)
+    {
         string full = Path.GetFullPath(path);
         Directory.CreateDirectory(Path.GetDirectoryName(full)!);
 
-        // 先写临时文件再原子替换：中途失败也不会留半个坏文件在硬盘上
         string tmp = full + ".tmp";
         try
         {

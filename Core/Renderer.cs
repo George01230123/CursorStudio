@@ -467,66 +467,63 @@ public static class Renderer
     }
 
     /// <summary>
-    /// 把多帧叠成一张"逐像素取最大 alpha"的并集图，只用来定热点。
+    /// 把 <paramref name="src"/> 按"逐像素取最大 alpha"并进 <paramref name="target"/>（就地改 target）。
     ///
-    /// 动画指针必须**所有帧共用一个热点**：系统是逐帧取热点坐标的，
-    /// 每帧各算各的会让指针在屏幕上抖，手感比不好看难受得多。
+    /// 动画的所有帧必须共用一个热点，自动热点要拿"所有帧的并集"来判尖角。
+    /// 并集不能靠"先把 N 帧全渲染出来再合"——那些位图归渲染缓存所有，缓存满了会淘汰并
+    /// Dispose，同时握着一大把是自找麻烦（60 帧时必然踩中）。所以做成"渲染一帧、并一帧"。
     ///
-    /// 这里不能用 GDI+ 一帧帧往上画：SourceOver 的 alpha 是 a₂ + a₁(1−a₂) 而不是取大值，
+    /// 也不能用 GDI+ 一层层往上画：SourceOver 的 alpha 是 a₂ + a₁(1−a₂) 而不是取大值，
     /// 边缘会越叠越实，"最靠左上的不透明像素"可能落在任何一帧上都不存在的位置。
     /// </summary>
-    public static Bitmap UnionAlpha(IReadOnlyList<Bitmap> frames)
+    public static void MergeAlphaMax(Bitmap target, Bitmap src)
     {
-        if (frames.Count == 0) throw new ArgumentException("至少要有一帧", nameof(frames));
+        if (target.Width != src.Width || target.Height != src.Height)
+            throw new ArgumentException("两张图尺寸要一致", nameof(src));
 
-        int w = frames[0].Width, h = frames[0].Height;
-        var union = new Bitmap(w, h, PixelFormat.Format32bppArgb);
+        int w = target.Width, h = target.Height;
 
-        var dst = union.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+        var dst = target.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadWrite, PixelFormat.Format32bppArgb);
         try
         {
-            int stride = dst.Stride;
-            var acc = new byte[stride * h];
-
-            foreach (var f in frames)
+            var s = src.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+            try
             {
-                var d = f.LockBits(new Rectangle(0, 0, f.Width, f.Height),
-                                   ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
-                try
+                int dstStride = Math.Abs(dst.Stride), srcStride = Math.Abs(s.Stride);
+                var dstRow = new byte[dstStride];
+                var srcRow = new byte[srcStride];
+
+                for (int y = 0; y < h; y++)
                 {
-                    var row = new byte[Math.Abs(d.Stride)];
-                    int absStride = Math.Abs(d.Stride);
-                    for (int y = 0; y < h; y++)
+                    Marshal.Copy(IntPtr.Add(dst.Scan0, y * dstStride), dstRow, 0, dstRow.Length);
+                    Marshal.Copy(IntPtr.Add(s.Scan0, y * srcStride), srcRow, 0, srcRow.Length);
+
+                    bool touched = false;
+                    for (int x = 0; x < w; x++)
                     {
-                        int srcRow = d.Stride >= 0 ? y : h - 1 - y;
-                        Marshal.Copy(IntPtr.Add(d.Scan0, srcRow * absStride), row, 0, row.Length);
-                        int dstRow = y * stride;
-                        for (int x = 0; x < w; x++)
-                        {
-                            byte a = row[x * 4 + 3];
-                            if (a <= acc[dstRow + x * 4 + 3]) continue;
-                            // 用这一帧的整像素覆盖，保证颜色和 alpha 是配套的
-                            acc[dstRow + x * 4] = row[x * 4];
-                            acc[dstRow + x * 4 + 1] = row[x * 4 + 1];
-                            acc[dstRow + x * 4 + 2] = row[x * 4 + 2];
-                            acc[dstRow + x * 4 + 3] = a;
-                        }
+                        byte a = srcRow[x * 4 + 3];
+                        if (a <= dstRow[x * 4 + 3]) continue;
+                        // 用这一帧的整像素覆盖，保证颜色和 alpha 是配套的
+                        dstRow[x * 4] = srcRow[x * 4];
+                        dstRow[x * 4 + 1] = srcRow[x * 4 + 1];
+                        dstRow[x * 4 + 2] = srcRow[x * 4 + 2];
+                        dstRow[x * 4 + 3] = a;
+                        touched = true;
                     }
-                }
-                finally
-                {
-                    f.UnlockBits(d);
+
+                    if (touched)
+                        Marshal.Copy(dstRow, 0, IntPtr.Add(dst.Scan0, y * dstStride), dstRow.Length);
                 }
             }
-
-            Marshal.Copy(acc, 0, dst.Scan0, acc.Length);
+            finally
+            {
+                src.UnlockBits(s);
+            }
         }
         finally
         {
-            union.UnlockBits(dst);
+            target.UnlockBits(dst);
         }
-
-        return union;
     }
 
     /// <summary>换尺寸时按比例搬运手点的热点。</summary>

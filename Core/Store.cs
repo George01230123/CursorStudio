@@ -277,14 +277,14 @@ public static class Store
                     var curFrames = new List<byte[]>(sources.Count);
                     for (int f = 0; f < sources.Count; f++)
                     {
-                        var images = RenderFrame(st, slot, sources[f], baseHot, cache, out string? err);
-                        if (images is null)
+                        // 每帧内部都是一个完整的 .cur，仍然带 32/48/64/96 四个尺寸
+                        var bytes = RenderFrameBytes(st, slot, sources[f], baseHot, cache, out string? err);
+                        if (bytes is null)
                         {
                             warnings.Add($"{slot.DisplayName}：第 {f + 1} 帧渲染失败 — {err}");
                             break;
                         }
-                        // 每帧内部都是一个完整的 .cur，仍然带 32/48/64/96 四个尺寸
-                        curFrames.Add(CurFile.BuildBytes(images));
+                        curFrames.Add(bytes);
                     }
 
                     if (curFrames.Count != sources.Count) continue;
@@ -293,13 +293,13 @@ public static class Store
                 }
                 else
                 {
-                    var images = RenderFrame(st, slot, sources[0], baseHot, cache, out string? err);
-                    if (images is null)
+                    var bytes = RenderFrameBytes(st, slot, sources[0], baseHot, cache, out string? err);
+                    if (bytes is null)
                     {
                         warnings.Add($"{slot.DisplayName}：渲染失败 — {err}");
                         continue;
                     }
-                    CurFile.Write(tmp, images);
+                    CurFile.WriteBytes(tmp, bytes);
                 }
 
                 string hash = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(tmp)))[..16].ToLowerInvariant();
@@ -346,22 +346,58 @@ public static class Store
             return single is null ? new Point(0, 0) : Renderer.AutoHotSpot(single, slot.DefaultHotSpot);
         }
 
-        var rendered = new List<Bitmap>(sources.Count);
-        foreach (var src in sources)
+        // 一帧渲染完就并进累加图，而不是先把 N 帧都攥在手里再合。
+        // 这里用 RenderOwned：图归自己所有，不受渲染缓存淘汰影响。
+        Bitmap? union = null;
+        try
         {
-            var bmp = cache.Render(src, settings, out _);
-            if (bmp is null) continue;
-            rendered.Add(bmp);
+            foreach (var src in sources)
+            {
+                var bmp = cache.RenderOwned(src, settings, out _);
+                if (bmp is null) continue;
+
+                if (union is null) union = bmp;          // 第一张直接接管，不用再复制一份
+                else
+                {
+                    Renderer.MergeAlphaMax(union, bmp);
+                    bmp.Dispose();
+                }
+            }
+
+            if (union is null) return new Point(0, 0);
+            return Renderer.AutoHotSpot(union, slot.DefaultHotSpot);
         }
-
-        if (rendered.Count == 0) return new Point(0, 0);
-        if (rendered.Count == 1) return Renderer.AutoHotSpot(rendered[0], slot.DefaultHotSpot);
-
-        using var union = Renderer.UnionAlpha(rendered);
-        return Renderer.AutoHotSpot(union, slot.DefaultHotSpot);
+        finally
+        {
+            union?.Dispose();
+        }
     }
 
-    /// <summary>把一帧源图渲染成"每个尺寸一张"的列表，热点按比例从 <paramref name="baseHot"/> 换算过去。</summary>
+    /// <summary>
+    /// 渲染一帧 → 拼成 .cur 字节 → 立刻把位图放掉。
+    /// 位图是 RenderOwned 出来的（归调用方），拼完字节就没有别的用处了。
+    /// </summary>
+    private static byte[]? RenderFrameBytes(SlotState st, CursorSlot slot, string source,
+                                            Point baseHot, RenderCache cache, out string? error)
+    {
+        var images = RenderFrame(st, slot, source, baseHot, cache, out error);
+        if (images is null) return null;
+
+        try
+        {
+            return CurFile.BuildBytes(images);
+        }
+        finally
+        {
+            foreach (var ci in images) ci.Bitmap.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// 把一帧源图渲染成"每个尺寸一张"的列表，热点按比例从 <paramref name="baseHot"/> 换算过去。
+    /// 每个 <see cref="CurImage.Bitmap"/> 都归调用方，读完像素要自己 Dispose——
+    /// 故意走 <see cref="RenderCache.RenderOwned"/> 而不是缓存版，免得被缓存淘汰掉。
+    /// </summary>
     private static List<CurImage>? RenderFrame(SlotState st, CursorSlot slot, string source,
                                               Point baseHot, RenderCache cache, out string? error)
     {
@@ -373,8 +409,12 @@ public static class Store
             var rs = st.ToRenderSettings();
             rs.Size = size;
 
-            var bmp = cache.Render(source, rs, out error);
-            if (bmp is null) return null;
+            var bmp = cache.RenderOwned(source, rs, out error);
+            if (bmp is null)
+            {
+                foreach (var done in images) done.Bitmap.Dispose();
+                return null;
+            }
 
             var hot = Renderer.RescaleHotSpot(baseHot.X, baseHot.Y, st.Size, size);
             images.Add(new CurImage(bmp, hot.X, hot.Y));
