@@ -62,6 +62,56 @@ public static class CursorRegistry
         return snap;
     }
 
+    /// <summary>
+    /// 指针位 → <c>SetSystemCursor</c> 的槽位编号。
+    ///
+    /// 只有这 14 个位置有对应的 OCR_* 常量；**NWPen / Pin / Person 没有**，
+    /// 它们只能靠注册表 + 广播，改了要等新开的窗口或者重新登录才看得到。
+    /// 这是 Windows 的限制，不是漏做。
+    /// </summary>
+    private static readonly Dictionary<string, uint> SessionSlots = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["Arrow"] = Win32.OCR_NORMAL,
+        ["Help"] = Win32.OCR_HELP,
+        ["AppStarting"] = Win32.OCR_APPSTARTING,
+        ["Wait"] = Win32.OCR_WAIT,
+        ["Crosshair"] = Win32.OCR_CROSS,
+        ["IBeam"] = Win32.OCR_IBEAM,
+        ["No"] = Win32.OCR_NO,
+        ["SizeNS"] = Win32.OCR_SIZENS,
+        ["SizeWE"] = Win32.OCR_SIZEWE,
+        ["SizeNWSE"] = Win32.OCR_SIZENWSE,
+        ["SizeNESW"] = Win32.OCR_SIZENESW,
+        ["SizeAll"] = Win32.OCR_SIZEALL,
+        ["UpArrow"] = Win32.OCR_UP,
+        ["Hand"] = Win32.OCR_HAND,
+    };
+
+    /// <summary>被系统限制、没法直接换会话槽位的指针位。</summary>
+    public static IEnumerable<string> SlotsWithoutSessionSupport =>
+        CursorSlots.All.Select(s => s.RegName).Where(n => !SessionSlots.ContainsKey(n));
+
+    /// <summary>
+    /// 把当前会话的系统光标直接换成这些文件，立刻生效。
+    /// 返回成功换掉的数量和失败的原因，供界面提示和自检断言。
+    /// </summary>
+    public static (int Done, int Skipped, List<string> Failed) ApplyToSession(IReadOnlyDictionary<string, string?> values)
+    {
+        int done = 0, skipped = 0;
+        var failed = new List<string>();
+
+        foreach (var slot in CursorSlots.All)
+        {
+            if (!SessionSlots.TryGetValue(slot.RegName, out uint ocr)) { skipped++; continue; }
+            if (!values.TryGetValue(slot.RegName, out string? path) || string.IsNullOrEmpty(path)) continue;
+
+            if (Win32.SetSessionCursor(path, ocr)) done++;
+            else failed.Add(slot.DisplayName);
+        }
+
+        return (done, skipped, failed);
+    }
+
     /// <summary>把若干指针位写到注册表并立即生效。没传进来的指针位保持原样不动。</summary>
     public static void Apply(IReadOnlyDictionary<string, string> values, string schemeName)
     {
@@ -76,6 +126,10 @@ public static class CursorRegistry
 
         key.Flush();
         Win32.BroadcastCursorChange();
+
+        // 广播在 Windows 11 25H2 上不一定能把当前会话换掉，所以再来一道硬的。
+        // 两道都做：注册表负责持久化，SetSystemCursor 负责"现在就看到"。
+        ApplyToSession(values.ToDictionary(kv => kv.Key, kv => (string?)kv.Value, StringComparer.OrdinalIgnoreCase));
     }
 
     /// <summary>按快照还原。快照里为 null 的值会被删掉，恢复成"当时这个值不存在"的状态。</summary>
@@ -98,6 +152,9 @@ public static class CursorRegistry
 
         key.Flush();
         Win32.BroadcastCursorChange();
+
+        // 还原也要落到当前会话上，否则"还原备份"之后屏幕上还是新指针
+        ApplyToSession(snap.Values);
     }
 
     /// <summary>
@@ -141,6 +198,8 @@ public static class CursorRegistry
         string? existingName = key.GetValue("", null, RegistryValueOptions.DoNotExpandEnvironmentNames) as string;
         bool wasSystemScheme = key.GetValue("Scheme Source") is int src && src == 2;
 
+        var sessionValues = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+
         foreach (var (name, file) in files)
         {
             if (file is null)
@@ -153,7 +212,10 @@ public static class CursorRegistry
             if (resolved is null)
                 key.DeleteValue(name, throwOnMissingValue: false);  // 系统里没有这套文件，交给 Windows 内置兜底
             else
+            {
                 key.SetValue(name, resolved, RegistryValueKind.String);
+                sessionValues[name] = resolved;
+            }
         }
 
         // 2 = 系统方案
@@ -164,6 +226,10 @@ public static class CursorRegistry
 
         key.Flush();
         Win32.BroadcastCursorChange();
+
+        // Crosshair / IBeam 系统本来就是内置的（上面留空了），这里没它们的份，
+        // 所以"恢复默认"之后这两处会保持当前会话里原来的样子——和注册表是一致的
+        ApplyToSession(sessionValues);
     }
 
     /// <summary>

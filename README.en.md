@@ -234,7 +234,7 @@ dotnet publish -c Release -o dist          # single-file exe
 
 ### Self-test
 
-The app ships a self-test: **183 checks** standalone, **197** with `--touch-system`. It covers image
+The app ships a self-test: **183 checks** standalone, **201** with `--touch-system`. It covers image
 processing (scaling / keying / de-haloing / shadow / hotspot mapping), the **full pipeline from UI settings to
 `.cur`/`.ani`**, the `.cur` and `.ani` binary formats (write + read back + a real `LoadImage` by Windows), GIF
 multi-frame import, **importing third-party theme packs**, scheme pack round-trip and `install.inf`, real
@@ -318,3 +318,7 @@ read for approach, and the two items explicitly noted above reuse their paramete
 - Windows constrains cursor images to roughly 32–64 pixels; larger sizes are simply not displayed
 - After applying, a few already-running programs may keep the old cursor until restarted; the login screen
   and newly started programs always show the new one
+- **Apply to system** does two things: writes the registry (persistent) *and* swaps the current session's
+  cursors directly (immediately visible). However **NWPen, Pin and Person** have no `OCR_*` slot for the
+  session call, so those three only take effect via the registry — you'll see them in newly started programs
+  or after signing in again. That's a Windows limitation, not an omission

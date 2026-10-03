@@ -1454,6 +1454,35 @@ internal static class SelfTest
             .Select(s => s.RegName).ToList();
         Check(diffs.Count == 0, "全部 17 个指针位都还原如初", string.Join(",", diffs));
 
+        // ---- 当前会话直接生效（SetSystemCursor） ----
+        // Windows 11 25H2 上有反馈说注册表和文件都写对了、但当前会话的指针槽位不跟着变，
+        // 所以 Apply/Restore 除了写注册表 + 广播，还会直接换一遍会话光标。
+        // 这里验的是"这一趟到底成没成"——GetCursorInfo 验不了（它只反映鼠标底下那个窗口
+        // 自己 SetCursor 的结果，鼠标停在浏览器上时永远不变）。
+        var unsupported = CursorRegistry.SlotsWithoutSessionSupport.ToList();
+        Check(unsupported.Count == 3 && unsupported.Contains("NWPen")
+              && unsupported.Contains("Pin") && unsupported.Contains("Person"),
+            "只有 NWPen / Pin / Person 没有会话槽位（Windows 就没给它们 OCR_*）",
+            string.Join("、", unsupported));
+
+        using (var probe = TestImages.Solid(32, 32, Color.FromArgb(255, 250, 30, 30)))
+        {
+            string probePath = TestImages.SaveTemp(probe, "session-probe.png");
+            string probeCur = Path.Combine(AppPaths.Root, "session-probe.cur");
+            CurFile.Write(probeCur, new[] { new CurImage(probe, 4, 3) });
+
+            var full = CursorSlots.All.ToDictionary(s => s.RegName, _ => (string?)probeCur);
+            var report = CursorRegistry.ApplyToSession(full);
+
+            Check(report.Failed.Count == 0,
+                "17 个指针位里能换会话光标的那些，全都换成功了",
+                string.Join("、", report.Failed));
+            Check(report.Done == 14 && report.Skipped == 3,
+                "成功 14 个、跳过 3 个（跳过的是系统没给槽位的）",
+                $"成功 {report.Done} / 跳过 {report.Skipped}");
+            Check(File.Exists(probePath), "（探针图已落地）");
+        }
+
         // ---- 「恢复 Windows 默认」按钮 ----
         try
         {
