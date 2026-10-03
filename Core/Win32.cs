@@ -72,6 +72,35 @@ internal static class Win32
         return false;
     }
 
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr LoadCursor(IntPtr hInstance, IntPtr lpCursorName);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr CopyIcon(IntPtr hIcon);
+
+    /// <summary>
+    /// 把某个系统光标槽位**恢复成 Windows 内置默认**。
+    ///
+    /// 有些指针位（十字准星、文本 I 形）在注册表里本来就没有值——系统方案用的一直是内置资源。
+    /// 这种位置没法"从文件还原"，只能走 <c>LoadCursor(NULL, IDC_*)</c> 拿内置的。
+    ///
+    /// 但内置句柄是**全进程共享**的，而 <c>SetSystemCursor</c> 会销毁传给它的句柄——
+    /// 直接传进去会把系统的共享光标毁掉，所以必须先 CopyIcon 复制一份再给。
+    /// </summary>
+    public static bool ResetSessionCursor(uint ocrId)
+    {
+        IntPtr shared = LoadCursor(IntPtr.Zero, (IntPtr)(int)ocrId);
+        if (shared == IntPtr.Zero) return false;
+
+        IntPtr copy = CopyIcon(shared);
+        if (copy == IntPtr.Zero) return false;
+
+        if (SetSystemCursor(copy, ocrId)) return true;
+
+        DestroyCursor(copy);
+        return false;
+    }
+
     /// <summary>
     /// 让 Windows 自己试着加载这个 .cur。返回 false 说明文件格式有问题——
     /// 这是比任何字节级校验都更硬的"系统认不认"的判据。

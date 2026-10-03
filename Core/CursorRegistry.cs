@@ -92,8 +92,12 @@ public static class CursorRegistry
         CursorSlots.All.Select(s => s.RegName).Where(n => !SessionSlots.ContainsKey(n));
 
     /// <summary>
-    /// 把当前会话的系统光标直接换成这些文件，立刻生效。
-    /// 返回成功换掉的数量和失败的原因，供界面提示和自检断言。
+    /// 把当前会话的系统光标换成这些文件，立刻生效。
+    ///
+    /// **值为 null / 空串表示"这个位置注册表里本来就没有值"**（系统方案里十字准星、I 形就是这样），
+    /// 这种情况要把会话光标**恢复成 Windows 内置默认**，而不是跳过。
+    /// 跳过的话，之前被换成别的东西的这个位置就会一直卡着——自检踩过这个坑：
+    /// 把 14 个会话光标换成测试图之后，还原时十字和 I 形被跳过，用户在桌面上就一直看到那张测试图。
     /// </summary>
     public static (int Done, int Skipped, List<string> Failed) ApplyToSession(IReadOnlyDictionary<string, string?> values)
     {
@@ -103,13 +107,35 @@ public static class CursorRegistry
         foreach (var slot in CursorSlots.All)
         {
             if (!SessionSlots.TryGetValue(slot.RegName, out uint ocr)) { skipped++; continue; }
-            if (!values.TryGetValue(slot.RegName, out string? path) || string.IsNullOrEmpty(path)) continue;
 
-            if (Win32.SetSessionCursor(path, ocr)) done++;
+            values.TryGetValue(slot.RegName, out string? path);
+            bool ok = string.IsNullOrEmpty(path)
+                ? Win32.ResetSessionCursor(ocr)     // 没有值 → 回内置默认
+                : Win32.SetSessionCursor(path, ocr);
+
+            if (ok) done++;
             else failed.Add(slot.DisplayName);
         }
 
         return (done, skipped, failed);
+    }
+
+    /// <summary>
+    /// 把所有能设置的会话光标都恢复成 Windows 内置默认。
+    /// 给"把会话恢复干净"用——比如自检跑完、或者用户觉得指针被改乱了想强制回默认。
+    /// </summary>
+    public static (int Done, List<string> Failed) ResetAllSessionCursors()
+    {
+        int done = 0;
+        var failed = new List<string>();
+
+        foreach (var (regName, ocr) in SessionSlots)
+        {
+            if (Win32.ResetSessionCursor(ocr)) done++;
+            else failed.Add(CursorSlots.ByRegName(regName)?.DisplayName ?? regName);
+        }
+
+        return (done, failed);
     }
 
     /// <summary>把若干指针位写到注册表并立即生效。没传进来的指针位保持原样不动。</summary>

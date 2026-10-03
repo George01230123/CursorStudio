@@ -1523,6 +1523,18 @@ internal static class SelfTest
         Check(final.Values.GetValueOrDefault("Arrow") == before.Values.GetValueOrDefault("Arrow"),
             "跑完「恢复 Windows 默认」之后仍然还原回了测试前的状态",
             $"测试前 {before.Values.GetValueOrDefault("Arrow")} / 现在 {final.Values.GetValueOrDefault("Arrow")}");
+
+        // 会话光标也必须还原干净。
+        // 这里踩过一次：ApplyToSession 原来遇到"注册表里没值"的位置是**跳过**的，
+        // 而上面把 14 个会话光标都换成了测试图，于是十字准星和文本 I 形就一直卡着测试图，
+        // 用户在桌面上直接看得见。现在没值的位置会恢复成 Windows 内置默认。
+        var tail = CursorRegistry.ApplyToSession(before.Values);
+        Check(tail.Failed.Count == 0,
+            "会话光标也按原快照还原了（没值的位置回内置默认，不会留下测试图）",
+            string.Join("、", tail.Failed));
+        Check(tail.Done + tail.Skipped == CursorSlots.All.Count && tail.Skipped == 3,
+            "14 个有会话槽位的都处理了，3 个没有槽位的按 Windows 限制跳过",
+            $"成功 {tail.Done} / 跳过 {tail.Skipped}");
     }
 
     // ================================================================ E. 界面布局
