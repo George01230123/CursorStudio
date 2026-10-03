@@ -1,6 +1,7 @@
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
+using System.Text;
 using CursorStudio.Core;
 
 namespace CursorStudio.UI;
@@ -569,6 +570,7 @@ public sealed class MainForm : Form
         bar.Controls.Add(MakeButton("保存", (_, _) => SaveScheme()));
         bar.Controls.Add(MakeButton("另存为…", (_, _) => SaveSchemeAs()));
         bar.Controls.Add(MakeButton("删除", (_, _) => DeleteScheme()));
+        bar.Controls.Add(MakeButton("导入主题包…", (_, _) => ImportThemePack()));
         bar.Controls.Add(MakeButton("导入方案包…", (_, _) => ImportPack()));
         bar.Controls.Add(MakeButton("导出方案包…", (_, _) => ExportPack()));
         return bar;
@@ -643,18 +645,23 @@ public sealed class MainForm : Form
                 var st = _ws.Peek(slot.RegName);
                 var item = new ListViewItem(slot.DisplayName) { Tag = slot };
 
-                if (st?.HasImage == true)
+                if (st?.IsConfigured == true)
                 {
                     string? err = null;
-                    var thumb = _cache.Render(st.SourceImage!, ThumbSettings(st), out err);
+                    // 外部文件（导入的主题包）读它的首帧；自己渲染的走缓存
+                    Bitmap? thumb = st.UsesExternal
+                        ? Store.ReadExternalPreview(st.ExternalCursor!, 20, out _)
+                        : _cache.Render(st.SourceImage!, ThumbSettings(st), out err);
+
                     if (thumb is not null)
                     {
                         // ImageList 会长期持有这张图；缓存里的图随时可能被淘汰，
                         // 所以必须复制一份给它，不能直接把缓存的引用塞进去
                         using var copy = new Bitmap(thumb);
+                        if (st.UsesExternal) thumb.Dispose();   // 这张是我们自己的
                         _slotIcons.Images.Add(copy);
                         item.ImageIndex = _slotIcons.Images.Count - 1;
-                        item.SubItems.Add("已设置");
+                        item.SubItems.Add(st.UsesExternal ? "外部" : "已设置");
                     }
                     else
                     {
@@ -748,6 +755,7 @@ public sealed class MainForm : Form
             UpdateBgButtonFace();
             UpdateBgEnabled();
             UpdateAnimationControls();
+            UpdateExternalUi();      // 放最后：外部文件要把上面这些再盖掉
         }
         finally
         {
@@ -788,9 +796,39 @@ public sealed class MainForm : Form
 
     private void UpdateBgEnabled()
     {
-        bool on = _removeBg.Checked;
+        bool on = _removeBg.Checked && !CurrentIsExternal;
         _bgColorBtn.Enabled = on;
         _tolerance.Enabled = on;
+    }
+
+    /// <summary>当前指针位用的是不是外部文件（导入的主题包）。</summary>
+    private bool CurrentIsExternal => _ws.Peek(_current)?.UsesExternal == true;
+
+    /// <summary>
+    /// 外部文件是原样使用的，渲染相关的设置对它**一点作用都没有**。
+    /// 所以这些控件直接灰掉，并在提示里说清楚——不然用户拖了半天没反应，会以为程序坏了。
+    /// </summary>
+    private void UpdateExternalUi()
+    {
+        bool ext = CurrentIsExternal;
+
+        _sizeBox.Enabled = !ext;
+        _modeBox.Enabled = !ext;
+        _scaleNum.Enabled = !ext;
+        _btnMatchSystem.Enabled = !ext;
+        _shadowCheck.Enabled = !ext;
+        _removeBg.Enabled = !ext;
+        _hotBox.Enabled = !ext;
+        _hotX.Enabled = !ext && _hotBox.SelectedIndex == 1;
+        _hotY.Enabled = _hotX.Enabled;
+        _delayNum.Enabled = !ext && _ws.Peek(_current)?.IsAnimated == true;
+        _btnStatic.Enabled = _delayNum.Enabled;
+
+        if (ext)
+        {
+            _frameInfo.Text = "原样使用外部文件";
+            _scalePx.Text = "";
+        }
     }
 
     // ================================================================ 动画
@@ -903,12 +941,50 @@ public sealed class MainForm : Form
 
         _animTimer.Stop();
 
-        if (st?.HasImage != true || slot is null)
+        if (st?.IsConfigured != true || slot is null)
         {
             _previewFrame = 0;
             _canvas.SetImage(null, Point.Empty);
             SwapActualImage(MakePlaceholder());
             SetTryCursor(null);
+            UpdateScaleHint();
+            UpdateStatus();
+            return;
+        }
+
+        // 外部文件（导入的主题包）不走渲染管线，直接读它本身
+        if (st.UsesExternal)
+        {
+            _animTimer.Stop();
+            _previewFrame = 0;
+
+            var external = Store.ReadExternalPreview(st.ExternalCursor!, st.Size, out Point extHot);
+            if (external is null)
+            {
+                _canvas.SetImage(null, Point.Empty);
+                SetStatus($"读不出外部指针文件：{Path.GetFileName(st.ExternalCursor!)}", error: true);
+                return;
+            }
+
+            try
+            {
+                _canvas.SetImage(external, extHot);
+                SwapActualImage(MakeActualPreview(external));
+
+                // 外部文件的热点是它自带的，回显出来让用户看得见
+                _loading = true;
+                _hotBox.SelectedIndex = 1;
+                _hotX.Value = Math.Clamp(extHot.X, 0, 255);
+                _hotY.Value = Math.Clamp(extHot.Y, 0, 255);
+                _loading = false;
+            }
+            finally
+            {
+                external.Dispose();
+            }
+
+            // 「试一试」直接把原文件交给系统：.ani 的话系统自己就会播
+            SetTryCursor(File.Exists(st.ExternalCursor!) ? st.ExternalCursor : null);
             UpdateScaleHint();
             UpdateStatus();
             return;
@@ -1210,7 +1286,6 @@ public sealed class MainForm : Form
             _scalePx.Text = "";
             return;
         }
-
         int target = Math.Clamp((int)Math.Round(st.Size * st.Scale), 1, st.Size);
         _scalePx.Text = $"长边约 {target} px";
     }
@@ -1381,16 +1456,21 @@ public sealed class MainForm : Form
     private void ApplyToAllSlots()
     {
         var src = _ws.Peek(_current);
-        if (src?.HasImage != true)
+        if (src?.IsConfigured != true)
         {
-            SetStatus("当前指针位还没有图片，先「导入图片」再套用。", error: true);
+            SetStatus("当前指针位还没有配图，先「导入图片」或「导入主题包」再套用。", error: true);
             return;
         }
 
+        bool external = src.UsesExternal;
         var ans = MessageBox.Show(this,
-            $"把当前这张图套用到全部 {CursorSlots.All.Count} 个指针位？\n\n" +
-            "· 每个指针位的热点会自动按类型重算（箭头取尖角、十字取正中）\n" +
-            "· 会覆盖掉其他指针位已经配好的图\n",
+            external
+                ? $"把当前这个指针文件原样套用到全部 {CursorSlots.All.Count} 个指针位？\n\n" +
+                  "· 所有位置都会用同一个文件（大小、热点都不改）\n" +
+                  "· 会覆盖掉其他指针位已经配好的图\n"
+                : $"把当前这张图套用到全部 {CursorSlots.All.Count} 个指针位？\n\n" +
+                  "· 每个指针位的热点会自动按类型重算（箭头取尖角、十字取正中）\n" +
+                  "· 会覆盖掉其他指针位已经配好的图\n",
             "套用到全部指针", MessageBoxButtons.OKCancel, MessageBoxIcon.Question);
         if (ans != DialogResult.OK) return;
 
@@ -1400,6 +1480,16 @@ public sealed class MainForm : Form
         {
             if (slot.RegName == _current) continue;
             var st = _ws.For(slot.RegName);
+
+            if (external)
+            {
+                st.ExternalCursor = src.ExternalCursor;
+                st.SourceImage = null;
+                st.ExtraFrames = null;
+                continue;
+            }
+
+            st.ExternalCursor = null;
             st.SourceImage = src.SourceImage;
             // 列表要复制一份，不能几个指针位共用同一个 List 对象
             st.ExtraFrames = src.ExtraFrames is null ? null : new List<string>(src.ExtraFrames);
@@ -1422,7 +1512,7 @@ public sealed class MainForm : Form
     private void ClearCurrentSlot()
     {
         var st = _ws.Peek(_current);
-        if (st?.HasImage != true)
+        if (st?.IsConfigured != true)
         {
             SetStatus("这个指针位本来就没有配图。");
             return;
@@ -1436,6 +1526,7 @@ public sealed class MainForm : Form
 
         st.SourceImage = null;
         st.ExtraFrames = null;
+        st.ExternalCursor = null;
         st.HotX = -1;
         st.HotY = -1;
 
@@ -1622,6 +1713,69 @@ public sealed class MainForm : Form
         Store.DeleteScheme(name);
         RefreshSchemeList();
         SetStatus($"方案「{name}」已删除。");
+    }
+
+    private void ImportThemePack()
+    {
+        using var dlg = new FolderBrowserDialog
+        {
+            Description = "选一个指针主题包文件夹（里面有 .cur / .ani，通常还带一个 install.inf）",
+            ShowNewFolderButton = false,
+        };
+        if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+        Store.ThemeImportResult result;
+        try
+        {
+            result = Store.ImportTheme(dlg.SelectedPath, _ws);
+        }
+        catch (Exception ex)
+        {
+            SetStatus("导入主题包失败：" + ex.Message, error: true);
+            MessageBox.Show(this, ex.Message, "导入失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        if (result.Applied.Count == 0)
+        {
+            SetStatus("这个文件夹里没找到能认出来的指针文件（.cur / .ani）。", error: true);
+            MessageBox.Show(this,
+                "这个文件夹里没有 .cur / .ani 文件，或者一个都没认出来。\n\n" +
+                "主题包通常是解压出来的一整个文件夹，里面应该有 normal.cur、link.cur、busy.ani 这类文件。",
+                "没认出来", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        _cache.Clear();
+        RefreshSlotList();
+        SelectSlot(_current);
+
+        // 把"认到了哪儿、靠什么认的、还有什么没认出来"一次说清楚，
+        // 用户才知道该不该手动补几个
+        var sb = new StringBuilder();
+        sb.AppendLine($"认出 {result.Applied.Count} 个指针位");
+        sb.AppendLine(result.InfPath is null
+            ? "（这个包没有 install.inf，是按文件名认的）"
+            : $"（按包里的 {result.InfPath} 认的）");
+        sb.AppendLine();
+
+        foreach (var (_, display, source) in result.Applied)
+            sb.AppendLine($"  · {display}　{(source == SlotMatchSource.InstallInf ? "包内指定" : "按文件名")}");
+
+        if (result.Unmapped.Count > 0)
+        {
+            sb.AppendLine();
+            sb.AppendLine($"没认出来（{result.Unmapped.Count} 个，没有动它们）：");
+            foreach (var name in result.Unmapped.Take(12)) sb.AppendLine("  · " + name);
+            if (result.Unmapped.Count > 12) sb.AppendLine($"  · …还有 {result.Unmapped.Count - 12} 个");
+        }
+
+        sb.AppendLine();
+        sb.AppendLine("这些位置是**原样使用**包里的文件（不改大小和热点）。");
+        sb.AppendLine("点「应用到系统」生效。");
+
+        MessageBox.Show(this, sb.ToString(), "导入主题包", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        SetStatus($"已从主题包认出 {result.Applied.Count} 个指针位。点「应用到系统」生效。");
     }
 
     private void ExportPack()

@@ -23,6 +23,8 @@ public static class AppPaths
     public static string Images => Path.Combine(Root, "images");
     public static string Cursors => Path.Combine(Root, "cursors");
     public static string Schemes => Path.Combine(Root, "schemes");
+    /// <summary>导入别人的主题包时，原样搬过来的 .cur/.ani 放这儿。</summary>
+    public static string Imported => Path.Combine(Root, "imported");
     public static string BackupFile => Path.Combine(Root, "backup-before-first-apply.json");
     public static string StateFile => Path.Combine(Root, "state.json");
 
@@ -32,6 +34,7 @@ public static class AppPaths
         Directory.CreateDirectory(Images);
         Directory.CreateDirectory(Cursors);
         Directory.CreateDirectory(Schemes);
+        Directory.CreateDirectory(Imported);
     }
 }
 
@@ -68,8 +71,25 @@ public sealed class SlotState
     /// <summary>每帧显示多久（毫秒）。只有动画指针用得上。</summary>
     public int FrameDelayMs { get; set; } = AniFile.DefaultDelayMs;
 
+    /// <summary>
+    /// 直接使用的外部 .cur/.ani 文件（导入别人的主题包时用）。
+    ///
+    /// 设了它就不再走渲染管线：别人做好的指针是设计好的样子，
+    /// 我们那套"缩到画布 70%、按类型重算热点"会把它改得面目全非。
+    /// 导入时会把这个文件复制到我们的目录里，原包删掉也不影响。
+    /// </summary>
+    public string? ExternalCursor { get; set; }
+
     [JsonIgnore]
     public bool HasImage => !string.IsNullOrEmpty(SourceImage);
+
+    /// <summary>这个指针位配了东西没有——不管是用图片渲染的还是外部文件。</summary>
+    [JsonIgnore]
+    public bool IsConfigured => HasImage || (!string.IsNullOrEmpty(ExternalCursor) && File.Exists(ExternalCursor));
+
+    /// <summary>用的是外部文件（原样使用）而不是自己渲染。</summary>
+    [JsonIgnore]
+    public bool UsesExternal => IsConfigured && !HasImage;
 
     /// <summary>是不是动画指针（两帧及以上）。</summary>
     [JsonIgnore]
@@ -147,7 +167,7 @@ public sealed class Workspace
 
     public SlotState? Peek(string regName) => Slots.TryGetValue(regName, out var s) ? s : null;
 
-    public int ConfiguredCount => CursorSlots.All.Count(s => Peek(s.RegName)?.HasImage == true);
+    public int ConfiguredCount => CursorSlots.All.Count(s => Peek(s.RegName)?.IsConfigured == true);
 
     /// <summary>导入方案包时没有随包带来的源图，仅用于界面提示，不写进 JSON。</summary>
     [JsonIgnore]
@@ -258,13 +278,34 @@ public static class Store
         foreach (var slot in CursorSlots.All)
         {
             var st = ws.Peek(slot.RegName);
-            if (st is null || !st.HasImage) continue;
-
-            var sources = st.AllFrames();
-            bool animated = sources.Count > 1;
+            if (st is null || !st.IsConfigured) continue;
 
             try
             {
+                // 外部文件（导入的主题包）：原样搬过来，一个像素都不动。
+                // 别人设计好的指针不该被我们的缩放和热点规则改样。
+                if (st.UsesExternal)
+                {
+                    string srcExt = Path.GetExtension(st.ExternalCursor!).ToLowerInvariant();
+                    if (srcExt is not (".cur" or ".ani")) srcExt = ".cur";
+
+                    string srcTmp = Path.Combine(staging, slot.RegName + srcExt);
+                    File.Copy(st.ExternalCursor!, srcTmp, overwrite: true);
+
+                    string srcHash = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(srcTmp)))[..16].ToLowerInvariant();
+                    string srcFinal = Path.Combine(AppPaths.Cursors, $"{slot.RegName}_{srcHash}{srcExt}");
+
+                    if (!File.Exists(srcFinal)) File.Move(srcTmp, srcFinal, overwrite: true);
+                    else File.Delete(srcTmp);
+
+                    files[slot.RegName] = srcFinal;
+                    CleanupOldCursors(slot.RegName, keep: Path.GetFileName(srcFinal));
+                    continue;
+                }
+
+                var sources = st.AllFrames();
+                bool animated = sources.Count > 1;
+
                 // 热点先一次性定在"用户当前看到的那个尺寸"上，再往各尺寸换算。
                 // 动画时用所有帧的并集来定，免得每帧各算各的导致系统播放时指针抖动。
                 Point baseHot = ResolveHotSpot(st, slot, sources, cache);
@@ -439,6 +480,87 @@ public static class Store
         catch { /* 旧文件删不掉不影响这次应用 */ }
     }
 
+    // ---------------------------------------------------------------- 导入别人的主题包
+
+    public sealed record ThemeImportResult(
+        List<(string Slot, string DisplayName, SlotMatchSource Source)> Applied,
+        List<string> Unmapped,
+        string? InfPath);
+
+    /// <summary>
+    /// 把一个主题包文件夹导进来：认出来的指针位改成"原样使用这个文件"，文件会复制到我们自己的目录。
+    ///
+    /// 认到哪个指针位是 <see cref="ThemeImport.Scan"/> 的事（优先读包里的 install.inf）。
+    /// 认不出来的文件原样报给用户，不猜着塞——塞错位置比没认出来更让人恼火。
+    /// </summary>
+    public static ThemeImportResult ImportTheme(string folder, Workspace ws)
+    {
+        AppPaths.EnsureAll();
+
+        var scan = ThemeImport.Scan(folder);
+        var applied = new List<(string, string, SlotMatchSource)>();
+
+        foreach (var f in scan.Mapped)
+        {
+            string slot = f.SlotRegName!;
+            var st = ws.For(slot);
+
+            st.ExternalCursor = CopyExternalCursor(f.Path);
+            // 外部文件优先，把旧的渲染来源清掉，免得两套配置打架
+            st.SourceImage = null;
+            st.ExtraFrames = null;
+
+            applied.Add((slot, CursorSlots.ByRegName(slot)?.DisplayName ?? slot, f.Source));
+        }
+
+        return new ThemeImportResult(
+            applied,
+            scan.Unmapped.Select(f => Path.GetFileName(f.Path)).ToList(),
+            scan.InfPath is null ? null : Path.GetFileName(scan.InfPath));
+    }
+
+    /// <summary>把外部 .cur/.ani 按内容哈希复制进 imported\，之后原包删了也不影响。</summary>
+    private static string CopyExternalCursor(string path)
+    {
+        byte[] bytes = File.ReadAllBytes(path);
+        string hash = Convert.ToHexString(SHA256.HashData(bytes))[..16].ToLowerInvariant();
+        string ext = Path.GetExtension(path).ToLowerInvariant();
+        if (ext is not (".cur" or ".ani")) ext = ".cur";
+
+        string dest = Path.Combine(AppPaths.Imported, hash + ext);
+        if (!File.Exists(dest))
+        {
+            string tmp = dest + ".tmp";
+            File.WriteAllBytes(tmp, bytes);
+            File.Move(tmp, dest, overwrite: true);
+        }
+
+        return dest;
+    }
+
+    /// <summary>
+    /// 读一个外部 .cur/.ani 的首帧，用于界面预览。返回的位图归调用方。
+    /// 动画只取第一帧——真正会动的是「试一试」那块，那儿交给系统自己播。
+    /// </summary>
+    public static Bitmap? ReadExternalPreview(string path, int size, out Point hot)
+    {
+        hot = Point.Empty;
+        if (!File.Exists(path)) return null;
+
+        if (Path.GetExtension(path).Equals(".ani", StringComparison.OrdinalIgnoreCase))
+        {
+            var frames = AniFile.ReadFrames(path, size, 1);
+            if (frames is null || frames.Count == 0) return null;
+            hot = new Point(frames[0].HotX, frames[0].HotY);
+            return frames[0].Image;      // 拿走这一帧的图，其余没解
+        }
+
+        var frame = CurFile.ReadFrame(path, size);
+        if (frame is null) return null;
+        hot = new Point(frame.HotX, frame.HotY);
+        return frame.Image;
+    }
+
     // ---------------------------------------------------------------- 备份
 
     public static bool HasBackup => File.Exists(AppPaths.BackupFile);
@@ -587,7 +709,17 @@ public static class Store
         foreach (var slot in CursorSlots.All)
         {
             var st = portable.Peek(slot.RegName);
-            if (st?.HasImage != true) continue;
+            if (st is null || !st.IsConfigured) continue;
+
+            if (st.UsesExternal)
+            {
+                // 外部文件（导入的主题包）没有源图，但成品已经在 cursors/ 里了——
+                // 把本机路径清掉，导入方会从包里的 cursors/ 恢复成"原样使用"
+                st.ExternalCursor = null;
+                st.SourceImage = null;
+                st.ExtraFrames = null;
+                continue;
+            }
 
             var frames = st.AllFrames();
             var entries = new List<string>(frames.Count);
@@ -846,6 +978,28 @@ public static class Store
             }
 
             st.SetFrames(landed);
+        }
+
+        // 包里只有成品、没有源图的位置（导入的主题包就是这样）：
+        // 把 cursors/ 里那个 .cur/.ani 解出来，继续"原样使用"
+        foreach (var (regName, st) in ws.Slots)
+        {
+            if (st.IsConfigured) continue;
+
+            var entry = zip.Entries.FirstOrDefault(e =>
+                e.FullName.StartsWith("cursors/" + regName + ".", StringComparison.OrdinalIgnoreCase));
+            if (entry is null) continue;
+
+            string ext = Path.GetExtension(entry.Name).ToLowerInvariant();
+            if (ext is not (".cur" or ".ani")) continue;
+
+            string dest = Path.Combine(AppPaths.Imported, $"pack_{Sanitize(regName)}{ext}");
+            using (var input = entry.Open())
+            using (var output = new FileStream(dest, FileMode.Create, FileAccess.Write))
+                input.CopyTo(output);
+
+            st.ExternalCursor = dest;
+            missing.Remove(CursorSlots.ByRegName(regName)?.DisplayName ?? regName);
         }
 
         ws.MissingImages = missing;

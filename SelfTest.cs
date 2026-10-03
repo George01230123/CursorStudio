@@ -72,6 +72,7 @@ internal static class SelfTest
             SectionRenderer();
             SectionPipeline();
             SectionAnimation();
+            SectionThemeImport();
             SectionCurFile();
             SectionSlots();
             SectionStockCursors();
@@ -764,6 +765,200 @@ internal static class SelfTest
         {
             Fail("动画测试出错：" + ex);
         }
+    }
+
+    // ================================================================ A4. 导入别人的主题包
+
+    /// <summary>
+    /// 主题包导入：认位、原样使用、进方案包再回来都还在。
+    /// 最关键的一条是"逐字节一致"——导入别人的指针就必须一个像素都不改，
+    /// 要是被我们那套缩放/热点规则改样了，这个功能就没有意义了。
+    /// </summary>
+    private static void SectionThemeImport()
+    {
+        Section("A4. 导入别人的主题包");
+
+        try
+        {
+            string root = Path.Combine(AppPaths.Root, "themepack");
+            Directory.CreateDirectory(root);
+
+            // ---- 造一个"按文件名能认出来"的包（没有 inf） ----
+            string noInf = Path.Combine(root, "no-inf");
+            Directory.CreateDirectory(noInf);
+
+            var expected = new (string File, string Slot, string Name)[]
+            {
+                ("normal.cur",        "Arrow",       "正常选择"),
+                ("help.cur",          "Help",        "帮助选择"),
+                ("busy.ani",          "Wait",        "忙碌"),
+                ("link.cur",          "Hand",        "链接选择"),
+                ("resizeNS.cur",      "SizeNS",      "垂直调整"),
+                ("dgn1.cur",          "SizeNWSE",    "对角线调整 1"),
+                ("unavailiable.cur",  "No",          "不可用"),   // 注意这个是主题包里常见的拼错
+            };
+
+            var written = new Dictionary<string, byte[]>();
+            for (int i = 0; i < expected.Length; i++)
+            {
+                string path = Path.Combine(noInf, expected[i].File);
+                byte[] bytes = MakeTestCursor(i, expected[i].File.EndsWith(".ani"));
+
+                if (expected[i].File.EndsWith(".ani")) AniFile.Write(path, new[] { bytes }, 32, 50);
+                else CurFile.WriteBytes(path, bytes);
+
+                written[expected[i].Slot] = File.ReadAllBytes(path);
+            }
+
+            var scan = ThemeImport.Scan(noInf);
+            Check(scan.MappedCount == expected.Length,
+                $"按文件名认出了 {expected.Length} 个指针位", $"实际 {scan.MappedCount}");
+            Check(scan.InfPath is null, "这个包确实没有 install.inf");
+
+            foreach (var e in expected)
+            {
+                string? got = scan.Files.FirstOrDefault(f =>
+                    string.Equals(Path.GetFileName(f.Path), e.File, StringComparison.OrdinalIgnoreCase))?.SlotRegName;
+                Check(got == e.Slot, $"「{e.File}」→ {e.Name}", $"实际认成了 {got ?? "(没认出来)"}");
+            }
+
+            // ---- 造一个"文件名认不出来、只能靠 inf"的包 ----
+            string withInf = Path.Combine(root, "with-inf");
+            Directory.CreateDirectory(withInf);
+
+            // 故意用毫无意义的文件名，只有 inf 说得清谁是谁
+            string[] opaque = { "aa.cur", "bb.cur", "cc.ani" };
+            string[] opaqueSlots = { "Arrow", "Hand", "Wait" };
+            var opaqueBytes = new Dictionary<string, byte[]>();
+            for (int i = 0; i < opaque.Length; i++)
+            {
+                string path = Path.Combine(withInf, opaque[i]);
+                byte[] bytes = MakeTestCursor(20 + i, opaque[i].EndsWith(".ani"));
+                if (opaque[i].EndsWith(".ani")) AniFile.Write(path, new[] { bytes }, 32, 50);
+                else CurFile.WriteBytes(path, bytes);
+                opaqueBytes[opaqueSlots[i]] = File.ReadAllBytes(path);
+            }
+
+            // 照着真实主题包（Bibata / apple_cursor 那一套）的写法来
+            var inf = new StringBuilder();
+            inf.AppendLine("[Version]");
+            inf.AppendLine("signature=\"$CHICAGO$\"");
+            inf.AppendLine();
+            inf.AppendLine("[DefaultInstall]");
+            inf.AppendLine("CopyFiles = Scheme.Cur");
+            inf.AppendLine("AddReg    = Scheme.Reg, Scheme.Apply");
+            inf.AppendLine();
+            inf.AppendLine("[DestinationDirs]");
+            inf.AppendLine("Scheme.Cur = 10,\"%CUR_DIR%\"");
+            inf.AppendLine();
+            inf.AppendLine("[Scheme.Reg]");
+            inf.AppendLine("HKCU,\"Control Panel\\Cursors\\Schemes\",\"%SCHEME_NAME%\",,\"%10%\\%CUR_DIR%\\%arrow%,,,,,,,,,,,,,,,,\"");
+            inf.AppendLine();
+            inf.AppendLine("[Scheme.Apply]");
+            inf.AppendLine("HKCU,\"Control Panel\\Cursors\",,0x00020000,\"%SCHEME_NAME%\"");
+            inf.AppendLine("HKCU,\"Control Panel\\Cursors\",Arrow,0x00020000,\"%10%\\%CUR_DIR%\\%arrow%\"");
+            inf.AppendLine("HKCU,\"Control Panel\\Cursors\",Hand,0x00020000,\"%10%\\%CUR_DIR%\\%hand%\"");
+            inf.AppendLine("HKCU,\"Control Panel\\Cursors\",Wait,0x00020000,\"%10%\\%CUR_DIR%\\%busy%\"");
+            inf.AppendLine();
+            inf.AppendLine("[Scheme.Cur]");
+            foreach (var f in opaque) inf.AppendLine(f);
+            inf.AppendLine();
+            inf.AppendLine("[Strings]");
+            inf.AppendLine("CUR_DIR     = \"Cursors\\Test Pack\"");
+            inf.AppendLine("SCHEME_NAME = \"Test Pack\"");
+            inf.AppendLine("arrow       = \"aa.cur\"");
+            inf.AppendLine("hand        = \"bb.cur\"");
+            inf.AppendLine("busy        = \"cc.ani\"");
+            File.WriteAllText(Path.Combine(withInf, "install.inf"), inf.ToString(), new UnicodeEncoding(false, true));
+
+            var scan2 = ThemeImport.Scan(withInf);
+            Check(scan2.InfPath is not null, "认出了包里的 install.inf");
+            foreach (var s in opaqueSlots)
+            {
+                string? got = scan2.Files.FirstOrDefault(f => f.SlotRegName == s)?.SlotRegName;
+                Check(got == s, $"按 install.inf 认出了 {CursorSlots.ByRegName(s)?.DisplayName}", $"实际 {got ?? "(没认出来)"}");
+            }
+
+            // ---- 真的导进来 ----
+            var ws = new Workspace { SchemeName = "主题包测试" };
+            var imported = Store.ImportTheme(noInf, ws);
+            Check(imported.Applied.Count == expected.Length,
+                $"导入了 {expected.Length} 个指针位", $"实际 {imported.Applied.Count}");
+            Check(imported.Unmapped.Count == 0, "没有认不出来的文件",
+                string.Join("、", imported.Unmapped));
+            Check(ws.ConfiguredCount == expected.Length,
+                "工作区里也确实配上了", $"实际 {ws.ConfiguredCount}");
+
+            var arrowState = ws.Peek("Arrow")!;
+            Check(arrowState.UsesExternal, "导入的是「原样使用外部文件」而不是重新渲染");
+            Check(!arrowState.HasImage, "没有留下会打架的渲染来源");
+
+            // ---- 原样使用：生成出来的文件和包里的一模一样 ----
+            using (var cache = new RenderCache())
+            {
+                var built = Store.BuildCursorFiles(ws, cache);
+                Check(built.Warnings.Count == 0, "生成过程没有警告", string.Join("；", built.Warnings));
+
+                bool allSame = true;
+                string firstDiff = "";
+                foreach (var (slot, source) in written)
+                {
+                    string? made = built.Files.GetValueOrDefault(slot);
+                    if (made is null) { allSame = false; firstDiff = $"{slot} 没生成"; break; }
+
+                    if (!File.ReadAllBytes(made).SequenceEqual(source))
+                    {
+                        allSame = false;
+                        firstDiff = $"{slot} 内容被改动了";
+                        break;
+                    }
+                }
+                Check(allSame, "成品和主题包里的原文件逐字节一致（一个像素都没改）", firstDiff);
+
+                // ---- 进方案包再回来，还得是原样使用 ----
+                string zip = Path.Combine(AppPaths.Root, "theme-pack.zip");
+                Store.ExportPack(ws, zip, built);
+
+                var back = Store.ImportPack(zip);
+                var backArrow = back.Peek("Arrow");
+                Check(backArrow?.UsesExternal == true, "方案包往返之后仍然是「原样使用」",
+                    $"UsesExternal={backArrow?.UsesExternal}");
+                Check(backArrow?.ExternalCursor is not null && File.Exists(backArrow.ExternalCursor),
+                    "外部文件跟着方案包回来了");
+
+                if (backArrow?.ExternalCursor is not null)
+                {
+                    Check(File.ReadAllBytes(backArrow.ExternalCursor).SequenceEqual(written["Arrow"]),
+                        "往返之后外部文件的内容也没变");
+                }
+
+                using var backCache = new RenderCache();
+                var rebuilt = Store.BuildCursorFiles(back, backCache);
+                string? again = rebuilt.Files.GetValueOrDefault("Arrow");
+                Check(again is not null && File.ReadAllBytes(again).SequenceEqual(written["Arrow"]),
+                    "往返之后重新生成，成品还是和原文件一致");
+            }
+
+            // ---- 认不出来的文件不能硬塞 ----
+            string junk = Path.Combine(root, "junk");
+            Directory.CreateDirectory(junk);
+            CurFile.WriteBytes(Path.Combine(junk, "totally-unknown-thing.cur"), MakeTestCursor(99, false));
+            var junkScan = ThemeImport.Scan(junk);
+            Check(junkScan.MappedCount == 0, "认不出来的文件不会被硬塞到某个指针位上",
+                $"实际认出了 {junkScan.MappedCount} 个");
+            Check(junkScan.Unmapped.Count() == 1, "它会出现在「没认出来」列表里");
+        }
+        catch (Exception ex)
+        {
+            Fail("主题包导入测试出错：" + ex);
+        }
+    }
+
+    /// <summary>造一个可以用的小 .cur 字节（每张颜色不同，方便区分）。</summary>
+    private static byte[] MakeTestCursor(int seed, bool animated)
+    {
+        using var bmp = TestImages.Solid(32, 32, Color.FromArgb(255, (byte)(40 + seed * 17 % 200), 90, 160));
+        return CurFile.BuildBytes(new[] { new CurImage(bmp, 8, 6) });
     }
 
     // ================================================================ B. .cur 格式

@@ -143,6 +143,29 @@ A few implementation decisions:
 
 ---
 
+## Importing cursor packs made by others
+
+Cursor theme packs downloaded from GitHub (Bibata, apple_cursor, BlueArchive…) can be pulled straight in:
+click **Import theme pack…** at the bottom and pick the folder — no need to assign each slot by hand.
+
+**Two ways to work out which file goes where, in priority order:**
+
+1. **Read the pack's `install.inf`** — theme packs almost always ship one, and it already states which file
+   belongs to which cursor slot. That is the author's own intent, far more reliable than guessing names.
+2. **Guess from the filename** — the only option for packs without an INF. High-star packs are remarkably
+   consistent (`normal` / `link` / `busy` / `resizeNS` / `dgn1` …), so the hit rate is decent.
+
+**Files that can't be identified are reported, never force-fitted into a slot** — putting a cursor in the
+wrong place is more annoying than admitting it wasn't recognised. (Windows 11 packs also carry `Pan`,
+`Zoom-in` and `Zoom-out`, which aren't among this tool's 17 slots; they're listed as unrecognised.)
+
+**Imported cursors are used exactly as-is**: no resizing, no hotspot recalculation, no re-encoding — not a
+single pixel changes. Someone else's finished design shouldn't be reshaped by our scaling rules, and the
+self-test asserts **the output is byte-identical to the file in the pack**. The trade-off is that the
+rendering settings are greyed out for those slots (changing them would do nothing).
+
+---
+
 ## Sharing with others
 
 **Export scheme pack** produces a zip:
@@ -211,10 +234,11 @@ dotnet publish -c Release -o dist          # single-file exe
 
 ### Self-test
 
-The app ships a self-test: **153 checks** standalone, **167** with `--touch-system`. It covers image
+The app ships a self-test: **183 checks** standalone, **197** with `--touch-system`. It covers image
 processing (scaling / keying / de-haloing / shadow / hotspot mapping), the **full pipeline from UI settings to
 `.cur`/`.ani`**, the `.cur` and `.ani` binary formats (write + read back + a real `LoadImage` by Windows), GIF
-multi-frame import, scheme pack round-trip and `install.inf`, real measurement of the stock cursors, UI
+multi-frame import, **importing third-party theme packs**, scheme pack round-trip and `install.inf`, real
+measurement of the stock cursors, UI
 layout, and registry read/write/restore.
 
 ```bash
